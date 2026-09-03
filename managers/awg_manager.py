@@ -1459,12 +1459,16 @@ x_exit_sync() {
             f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}")
         action = ('x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF"\n' if teardown
                   else 'x_exit_sync\n')
+        # One docker step per sudo call: the sudo prefix covers only the first
+        # command of a `&&` chain, the rest would run unprivileged.
         self.ssh.upload_file(functions + action, "/tmp/_amnz_exit.sh")
         out, err, code = self.ssh.run_sudo_command(
-            f"docker cp /tmp/_amnz_exit.sh {container_name}:/tmp/_amnz_exit.sh && "
-            f"docker exec {container_name} bash /tmp/_amnz_exit.sh",
-            timeout=60,
-        )
+            f"docker cp /tmp/_amnz_exit.sh {container_name}:/tmp/_amnz_exit.sh")
+        if code != 0:
+            self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
+            raise RuntimeError(f"exit link apply failed: {err or out}")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} bash /tmp/_amnz_exit.sh", timeout=60)
         self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
         if code != 0:
             raise RuntimeError(f"exit link apply failed: {out or err}")
@@ -1477,15 +1481,21 @@ x_exit_sync() {
         awg_params, exit_uid, exit_name, dns_via_exit."""
         container_name = self._container_name(protocol_type)
         self.ssh.upload_file(self._exit_conf_body(link), "/tmp/_amnz_exit0.conf")
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} mkdir -p {EXIT_DIR} && "
-            f"docker cp /tmp/_amnz_exit0.conf {container_name}:{EXIT_CONF} && "
+        # One docker step per sudo call (the sudo prefix covers only the first
+        # command of a `&&` chain).
+        steps = (
+            f"docker exec -i {container_name} mkdir -p {EXIT_DIR}",
+            f"docker cp /tmp/_amnz_exit0.conf {container_name}:{EXIT_CONF}",
             f"docker exec -i {container_name} bash -c 'k=$(cat {EXIT_KEY}) && "
-            f"sed -i \"s|{ENTRY_PRIVATE_KEY_PLACEHOLDER}|$k|\" {EXIT_CONF} && chmod 600 {EXIT_CONF}'"
+            f"sed -i \"s|{ENTRY_PRIVATE_KEY_PLACEHOLDER}|$k|\" {EXIT_CONF} && chmod 600 {EXIT_CONF}'",
         )
-        self.ssh.run_command("rm -f /tmp/_amnz_exit0.conf")
-        if code != 0:
-            raise RuntimeError(f"Failed to write exit0.conf: {err or out}")
+        try:
+            for step in steps:
+                out, err, code = self.ssh.run_sudo_command(step)
+                if code != 0:
+                    raise RuntimeError(f"Failed to write exit0.conf: {err or out}")
+        finally:
+            self.ssh.run_command("rm -f /tmp/_amnz_exit0.conf")
         # Resolved path: an older legacy install may keep its config at awg0.conf.
         self._write_start_script(protocol_type, config_path=self._resolve_config_path(protocol_type))
         return self._exit_apply(protocol_type)
