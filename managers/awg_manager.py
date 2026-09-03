@@ -769,7 +769,7 @@ echo "HOST_CONNTRACK=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
 echo "HOST_CONNTRACK_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
 echo "HOST_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
 echo "HOST_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null)"
-for c in $(docker ps -a --format '{{.Names}}' | grep '^amnezia-awg' | sort); do
+for c in $(docker ps -a --format '{{.Names}}' | grep -E '^amnezia-(awg|exit)' | sort); do
   echo "CT_NAME=$c"
   if docker ps --format '{{.Names}}' | grep -qx "$c"; then
     echo "CT_RUNNING=1"
@@ -1161,9 +1161,22 @@ H4 = {awg_params['transport_packet_magic_header']}
 {image}"""
 
     @staticmethod
-    def _start_script_body(config_path, quick_bin, userspace_guard, subnet_default, bwlimits_path):
+    def _mss_clamp_body(iface):
+        """Clamp TCP MSS on a transit link in both directions, so a tunnel
+        carried inside another tunnel never depends on PMTU discovery."""
+        return (
+            f"# Clamp TCP MSS on the transit link so entry->exit->internet never needs fragmentation\n"
+            f"iptables -t mangle -A FORWARD -i {iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+            f"iptables -t mangle -A FORWARD -o {iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+        )
+
+    @staticmethod
+    def _start_script_body(config_path, quick_bin, userspace_guard, subnet_default, bwlimits_path,
+                           extra_blocks=()):
         """/opt/amnezia/start.sh of a protocol container: brings the tunnel
-        up, sets up forwarding/NAT and applies per-peer bandwidth limits."""
+        up, sets up forwarding/NAT and applies per-peer bandwidth limits.
+        `extra_blocks` are appended verbatim before the final `tail -f`."""
+        extra = ''.join(f"{block}\n" for block in extra_blocks)
         return f"""#!/bin/bash
 echo "Container startup"
 
@@ -1220,7 +1233,7 @@ if [ -f {bwlimits_path} ]; then
 )
 fi
 
-tail -f /dev/null
+{extra}tail -f /dev/null
 """
 
     def _render_start_script(self, protocol_type, config_path=None):
