@@ -13,6 +13,7 @@ from datetime import datetime
 
 from managers.awg_manager import (
     AWG_QUICK_FORCE_USERSPACE_PATCH,
+    TRANSIT_PARAM_KEYS,
     AWGManager,
     generate_awg_params,
     generate_psk,
@@ -25,21 +26,6 @@ EXIT_DEFAULTS = {
     'subnet': '10.9.0.0/24',
     'mtu': '1420',
 }
-
-# Obfuscation keys written on the transit hop. S3/S4 pad every cookie/transport
-# packet and would eat into the MTU budget (client 1376 + 60 bytes WireGuard
-# overhead on the exit link), so only the handshake-side keys are used.
-TRANSIT_PARAM_KEYS = (
-    ('junk_packet_count', 'Jc'),
-    ('junk_packet_min_size', 'Jmin'),
-    ('junk_packet_max_size', 'Jmax'),
-    ('init_packet_junk_size', 'S1'),
-    ('response_packet_junk_size', 'S2'),
-    ('init_packet_magic_header', 'H1'),
-    ('response_packet_magic_header', 'H2'),
-    ('underload_packet_magic_header', 'H3'),
-    ('transport_packet_magic_header', 'H4'),
-)
 
 
 class ExitManager(AWGManager):
