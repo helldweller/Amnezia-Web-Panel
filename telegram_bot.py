@@ -36,10 +36,11 @@ _pending_inputs = {}
 _EXTRA_PROTOCOL_DISPLAY_NAMES = {
     "dns": "AmneziaDNS",
     "socks5": "SOCKS5",
+    "exit": "Exit Node",
     "adguard": "AdGuard Home",
     "nginx": "NGINX",
 }
-SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx"}
+SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx", "exit"}
 
 TG_TRANSLATIONS = {
     "en": {
@@ -654,6 +655,7 @@ def _get_ssh_and_manager(server: dict, proto: str):
     from managers.socks5_manager import Socks5Manager
     from managers.adguard_manager import AdguardManager
     from managers.nginx_manager import NginxManager
+    from managers.exit_manager import ExitManager
 
     ssh = SSHManager(
         server["host"],
@@ -677,6 +679,8 @@ def _get_ssh_and_manager(server: dict, proto: str):
         manager = AdguardManager(ssh)
     elif base == "nginx":
         manager = NginxManager(ssh, proto)
+    elif base == "exit":
+        manager = ExitManager(ssh, proto)
     else:
         manager = AWGManager(ssh)
     return ssh, manager
