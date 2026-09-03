@@ -202,8 +202,8 @@ class ExitInstallTests(unittest.TestCase):
         self.assertIn('-i transit0 -p tcp', script)
         self.assertIn('-o transit0 -p tcp', script)
         self.assertLess(script.index('TCPMSS'), script.index('tail -f /dev/null'))
-        # nothing of the exit block leaks into the plain AWG script
-        self.assertNotIn('TCPMSS', AWGManager(None)._render_start_script('awg'))
+        # the plain AWG script carries the entry-side block, not the exit clamp
+        self.assertNotIn('transit0', AWGManager(None)._render_start_script('awg'))
 
 
 class ExitPeerTests(unittest.TestCase):
