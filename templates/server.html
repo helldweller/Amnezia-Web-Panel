@@ -801,6 +801,7 @@
                 <label class="form-label">{{ _('awg_mtu') }}</label>
                 <input class="form-input" type="number" id="awgSetMtu" min="576" max="65535">
                 <div class="form-hint">{{ _('awg_mtu_hint') }}</div>
+                <div class="form-hint hidden" id="awgSetMtuExitHint"></div>
             </div>
             <div class="form-group">
                 <label class="form-label">DNS 1</label>
@@ -866,6 +867,12 @@
             <label class="form-label">{{ _('exit_link_select') }}</label>
             <select class="form-input" id="exitLinkSelect"></select>
             <div class="form-hint" id="exitLinkSelectHint"></div>
+        </div>
+        <div class="form-group hidden" id="exitDnsGroup">
+            <label class="form-label" style="display:flex; align-items:center; gap:var(--space-sm);">
+                <input type="checkbox" id="exitDnsViaExit" onchange="saveExitDns(this.checked)"> {{ _('exit_dns_via_exit') }}
+            </label>
+            <div class="form-hint">{{ _('exit_dns_via_exit_hint') }}</div>
         </div>
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('exitLinkModal')">{{ _('cancel') }}</button>
@@ -2465,6 +2472,13 @@
             document.getElementById('awgSetMtu').value = data.mtu || '1376';
             document.getElementById('awgSetDns1').value = data.dns1 || '';
             document.getElementById('awgSetDns2').value = data.dns2 || '';
+            const exitHint = document.getElementById('awgSetMtuExitHint');
+            exitHint.classList.toggle('hidden', !data.exit_linked);
+            if (data.exit_linked) {
+                const over = Number(data.mtu) > Number(data.exit_mtu);
+                exitHint.textContent = _('awg_mtu_exit_hint').replace('{exit_mtu}', data.exit_mtu);
+                exitHint.style.color = over ? 'var(--danger, #f87171)' : '';
+            }
             const junkGroup = document.getElementById('awgSetJunkGroup');
             junkGroup.style.display = data.supports_special_junk ? '' : 'none';
             SPECIAL_JUNK_KEYS.forEach(key => {
@@ -2513,7 +2527,8 @@
     let currentExitLinkProto = null;
     let currentExitLinkState = null;
     const EXIT_LINK_ERROR_KEYS = ['exit_no_handshake', 'exit_mtu_too_big', 'exit_self', 'exit_legacy_obfuscation',
-        'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'not_linked'];
+        'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'exit_dns_needs_dns',
+        'not_linked'];
 
     function exitStatusBadge(status, link) {
         const badge = (cls, text, title = '') => `<span class="badge ${cls}" title="${escapeHtml(title)}"><span class="badge-dot"></span> ${escapeHtml(text)}</span>`;
@@ -2579,6 +2594,8 @@
         const repairBtn = document.getElementById('exitRepairBtn');
         unlinkBtn.classList.toggle('hidden', !link);
         document.getElementById('exitEgressBtn').classList.toggle('hidden', !link);
+        document.getElementById('exitDnsGroup').classList.toggle('hidden', !link);
+        document.getElementById('exitDnsViaExit').checked = !!(link && link.dns_via_exit);
         repairBtn.classList.toggle('hidden', !(link && (link.stale || !(state.exit_link_status && state.exit_link_status.up))));
         if (!link) {
             el.innerHTML = `<div class="form-hint">${_('exit_link_none')}</div>`;
@@ -2696,6 +2713,22 @@
             box.innerHTML = `<div class="form-hint" style="color:var(--danger, #f87171)">${_('error')}: ${escapeHtml(exitLinkErrorText(err))}</div>`;
         } finally {
             btn.disabled = false;
+        }
+    }
+
+    async function saveExitDns(enabled) {
+        const box = document.getElementById('exitDnsViaExit');
+        box.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/exit-link/dns`, 'POST',
+                          { protocol: currentExitLinkProto, enabled: !!enabled });
+            showToast(_(enabled ? 'exit_dns_via_exit_on' : 'exit_dns_via_exit_off'), 'success');
+            if (currentExitLinkState && currentExitLinkState.exit_link) currentExitLinkState.exit_link.dns_via_exit = !!enabled;
+        } catch (err) {
+            box.checked = !enabled;
+            showToast(_('error') + ': ' + exitLinkErrorText(err), 'error');
+        } finally {
+            box.disabled = false;
         }
     }
 
