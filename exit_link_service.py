@@ -332,6 +332,34 @@ class ExitLinkService:
                 results.append({'protocol': proto, 'exit_uid': link['exit_uid'], 'status': 'error', 'error': str(err)})
         return results
 
+    async def check_egress(self, entry_server_id, protocol):
+        """Ask the entry container which public IP its clients leave from and
+        compare it with the exit node's address. `leaks` means the clients
+        still leave from the entry node itself."""
+        data = self.load_data()
+        entry, rec = self._entry(data, entry_server_id, protocol)
+        link = rec.get('exit_link')
+        if not link:
+            raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
+        awg = self._awg(entry)
+        try:
+            probe = await asyncio.to_thread(awg.exit_check_egress, protocol)
+        except RuntimeError as err:
+            raise ExitLinkError('exit_egress_failed', str(err))
+        via, direct = probe.get('via_exit', ''), probe.get('direct', '')
+        expected = link.get('endpoint_host', '')
+        return {
+            'status': 'success',
+            'via_exit': via,
+            'direct': direct,
+            'expected': expected,
+            'exit_name': link.get('exit_name', ''),
+            # A NATed exit answers from another address, so a mismatch is a
+            # warning, not a failure; leaving from the entry address is not.
+            'matches': bool(via) and via == expected,
+            'leaks': bool(via) and via == direct,
+        }
+
     async def status(self, entry_server_id, protocol):
         data = self.load_data()
         entry, rec = self._entry(data, entry_server_id, protocol)

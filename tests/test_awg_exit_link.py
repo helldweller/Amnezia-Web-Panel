@@ -6,6 +6,7 @@ import unittest
 
 from managers.awg_manager import (
     DNS_NET,
+    EGRESS_CHECK_URLS,
     EXIT_CONF,
     EXIT_HANDSHAKE_UP_SECONDS,
     EXIT_KEY,
@@ -247,6 +248,48 @@ class ExitLinkMethodsTests(unittest.TestCase):
         broken = self.manager.exit_link_status('awg2')
         self.assertFalse(broken['up'])
         self.assertIn('No such device', broken['error'])
+
+
+class ExitEgressCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.ssh = RecordingSSH()
+        self.manager = AWGManager(self.ssh)
+        # the subnet IP comes from the server config the probe binds to
+        self.ssh.answers['cat /opt/amnezia/awg/awg0.conf'] = (
+            '[Interface]\nAddress = 172.16.21.1/24\nListenPort = 55424\n', '', 0)
+
+    def test_probe_script_is_posix_sh_and_quote_free(self):
+        script = AWGManager._egress_probe_script('10.8.1.1')
+        # it is single-quoted into `docker exec sh -c '...'`
+        self.assertNotIn("'", script)
+        self.assertIn('--interface 10.8.1.1', script)
+        for url in EGRESS_CHECK_URLS:
+            self.assertIn(url, script)
+        if shutil.which('sh'):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, 'probe.sh')
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(script + '\n')
+                self.assertEqual(subprocess.run(['sh', '-n', path]).returncode, 0)
+
+    def test_check_egress_splits_the_two_probes(self):
+        self.ssh.answers['echo ---'] = ('203.0.113.5\n---\n198.51.100.1\n', '', 0)
+        self.assertEqual(self.manager.exit_check_egress('awg2'),
+                         {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'})
+        cmd = next(c for c in self.ssh.commands if 'echo ---' in c)
+        self.assertIn('docker exec -i amnezia-awg2', cmd)
+        # bound to the gateway of this instance, not to the default subnet
+        self.assertIn('--interface 172.16.21.1', cmd)
+
+    def test_check_egress_tolerates_empty_and_garbage_answers(self):
+        self.ssh.answers['echo ---'] = ('\n---\n<html>error</html>\n', '', 0)
+        self.assertEqual(self.manager.exit_check_egress('awg2'), {'via_exit': '', 'direct': ''})
+
+    def test_check_egress_raises_when_the_container_is_gone(self):
+        self.ssh.answers['echo ---'] = ('', 'No such container: amnezia-awg2', 1)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.manager.exit_check_egress('awg2')
+        self.assertIn('No such container', str(ctx.exception))
 
 
 if __name__ == '__main__':

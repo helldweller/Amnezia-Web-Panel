@@ -860,6 +860,7 @@
         </div>
         <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('exit_link_desc') }}</div>
         <div id="exitLinkState" style="margin-bottom:var(--space-md);"></div>
+        <div id="exitLinkEgress"></div>
         <div id="exitLinkWarnings"></div>
         <div class="form-group">
             <label class="form-label">{{ _('exit_link_select') }}</label>
@@ -868,6 +869,7 @@
         </div>
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('exitLinkModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-secondary hidden" onclick="checkExitEgress()" id="exitEgressBtn">{{ _('exit_egress_check') }}</button>
             <button class="btn btn-secondary hidden" onclick="repairExitLink()" id="exitRepairBtn">{{ _('exit_link_repair') }}</button>
             <button class="btn btn-danger hidden" onclick="removeExitLink()" id="exitUnlinkBtn">{{ _('exit_unlink_btn') }}</button>
             <button class="btn btn-primary" onclick="saveExitLink(false)" id="exitLinkBtn">
@@ -2511,7 +2513,7 @@
     let currentExitLinkProto = null;
     let currentExitLinkState = null;
     const EXIT_LINK_ERROR_KEYS = ['exit_no_handshake', 'exit_mtu_too_big', 'exit_self', 'exit_legacy_obfuscation',
-        'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'not_linked'];
+        'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'not_linked'];
 
     function exitStatusBadge(status, link) {
         const badge = (cls, text, title = '') => `<span class="badge ${cls}" title="${escapeHtml(title)}"><span class="badge-dot"></span> ${escapeHtml(text)}</span>`;
@@ -2576,6 +2578,7 @@
         const unlinkBtn = document.getElementById('exitUnlinkBtn');
         const repairBtn = document.getElementById('exitRepairBtn');
         unlinkBtn.classList.toggle('hidden', !link);
+        document.getElementById('exitEgressBtn').classList.toggle('hidden', !link);
         repairBtn.classList.toggle('hidden', !(link && (link.stale || !(state.exit_link_status && state.exit_link_status.up))));
         if (!link) {
             el.innerHTML = `<div class="form-hint">${_('exit_link_none')}</div>`;
@@ -2600,6 +2603,9 @@
         hint.textContent = '';
         document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('loading')}</div>`;
         document.getElementById('exitLinkWarnings').innerHTML = '';
+        document.getElementById('exitLinkEgress').innerHTML = '';
+        // hidden until the state says this instance is linked
+        document.getElementById('exitEgressBtn').classList.add('hidden');
         openModal('exitLinkModal');
         try {
             const [nodes, state] = await Promise.all([
@@ -2665,6 +2671,32 @@
     async function removeExitLink() {
         if (!confirm(_('exit_unlink_confirm'))) return;
         await exitLinkRequest('/remove', { protocol: currentExitLinkProto }, 'exit_unlinked');
+    }
+
+    async function checkExitEgress() {
+        const box = document.getElementById('exitLinkEgress');
+        const btn = document.getElementById('exitEgressBtn');
+        box.innerHTML = `<div class="form-hint">${_('exit_egress_checking')}</div>`;
+        btn.disabled = true;
+        try {
+            const r = await apiCall(`/api/servers/${SERVER_ID}/exit-link/check-egress`, 'POST', { protocol: currentExitLinkProto });
+            const via = escapeHtml(r.via_exit || '');
+            let text, color;
+            if (!r.via_exit) {
+                text = _('exit_egress_unknown'); color = 'var(--danger, #f87171)';
+            } else if (r.leaks) {
+                text = _('exit_egress_direct').replace('{ip}', via); color = 'var(--danger, #f87171)';
+            } else if (r.matches) {
+                text = _('exit_egress_match').replace('{ip}', via).replace('{name}', escapeHtml(r.exit_name || '')); color = 'var(--success, #4ade80)';
+            } else {
+                text = _('exit_egress_mismatch').replace('{ip}', via).replace('{expected}', escapeHtml(r.expected || '')); color = 'var(--warning, #fbbf24)';
+            }
+            box.innerHTML = `<div class="form-hint" style="color:${color}">${text}</div>`;
+        } catch (err) {
+            box.innerHTML = `<div class="form-hint" style="color:var(--danger, #f87171)">${_('error')}: ${escapeHtml(exitLinkErrorText(err))}</div>`;
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     async function repairExitLink() {
