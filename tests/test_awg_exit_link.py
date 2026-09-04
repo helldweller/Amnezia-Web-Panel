@@ -173,10 +173,15 @@ class ExitLinkMethodsTests(unittest.TestCase):
 
         self.assertEqual(out, 'exit link up: 10.9.0.7/24 -> table 200')
         self.assertEqual(self.ssh.uploads['/tmp/_amnz_exit0.conf'], AWGManager._exit_conf_body(LINK))
-        write = next(c for c in self.ssh.commands if '_amnz_exit0.conf' in c and 'docker cp' in c)
-        self.assertIn(f'docker cp /tmp/_amnz_exit0.conf amnezia-awg2:{EXIT_CONF}', write)
-        self.assertIn(f'sed -i "s|{ENTRY_PRIVATE_KEY_PLACEHOLDER}|$k|" {EXIT_CONF}', write)
-        self.assertIn(f'chmod 600 {EXIT_CONF}', write)
+        # every docker step is its own sudo call (sudo only covers the first
+        # command of a `&&` chain) and none of them chains another docker call
+        steps = [c for c in self.ssh.commands if 'amnezia-awg2' in c and '_amnz_exit0.conf' in c or 'exit_private.key' in c]
+        self.assertTrue(any(c == f'docker cp /tmp/_amnz_exit0.conf amnezia-awg2:{EXIT_CONF}' for c in steps))
+        substitute = next(c for c in steps if 'sed -i' in c)
+        self.assertIn(f'sed -i "s|{ENTRY_PRIVATE_KEY_PLACEHOLDER}|$k|" {EXIT_CONF}', substitute)
+        self.assertIn(f'chmod 600 {EXIT_CONF}', substitute)
+        for c in self.ssh.commands:
+            self.assertFalse(c.count('docker ') > 1 and '&&' in c, f'chained docker calls under one sudo: {c}')
         # start.sh refreshed for the resolved path, without a restart
         self.assertEqual(self.ssh.uploads['/tmp/_amnz_start.sh'],
                          self.manager._render_start_script('awg2', '/opt/amnezia/awg/awg0.conf'))
@@ -185,7 +190,8 @@ class ExitLinkMethodsTests(unittest.TestCase):
         apply_script = self.ssh.uploads['/tmp/_amnz_exit.sh']
         self.assertTrue(apply_script.endswith('x_exit_sync\n'))
         self.assertIn('x_killswitch_on()', apply_script)
-        self.assertTrue(any('docker exec amnezia-awg2 bash /tmp/_amnz_exit.sh' in c for c in self.ssh.commands))
+        self.assertIn('docker cp /tmp/_amnz_exit.sh amnezia-awg2:/tmp/_amnz_exit.sh', self.ssh.commands)
+        self.assertIn('docker exec amnezia-awg2 bash /tmp/_amnz_exit.sh', self.ssh.commands)
 
     def test_link_raises_when_apply_fails(self):
         self.ssh.answers['_amnz_exit.sh'] = ('! FATAL: policy routing for exit0 is not in place', '', 3)
