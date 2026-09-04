@@ -416,6 +416,16 @@
             </div>
         </div>
 
+        <!-- BLOCK: Exit nodes -->
+        <div class="card" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">🚪 {{ _('exit_defaults_title') }}</h3>
+            <div class="form-group">
+                <label class="form-label">{{ _('exit_default_node') }}</label>
+                <select class="form-input" id="exitDefaultNode"><option value="">{{ _('exit_default_none') }}</option></select>
+                <p class="form-hint">{{ _('exit_default_hint') }}</p>
+            </div>
+        </div>
+
         <!-- BLOCK: Self-Service -->
         <div class="card" style="margin-top: var(--space-lg);">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);">🔐 {{ _('self_service_title') }}</h3>
@@ -909,13 +919,17 @@
             allowed_protocols: Array.from(document.querySelectorAll('input[name="ss_proto"]:checked')).map(el => el.value),
         };
 
+        const exit_nodes = { default_exit_uid: document.getElementById('exitDefaultNode').value || '' };
+
         try {
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, auto_backup, self_service })
+                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, auto_backup, self_service, exit_nodes })
             });
             if (!res.ok) throw new Error(_('error'));
+            const saved = await res.json();
+            (saved.warnings || []).forEach(w => showToast(_(w), 'info'));
             showToast(_('settings_saved'), 'success');
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -1130,9 +1144,27 @@
         }
     }
 
+    async function loadExitNodes() {
+        const select = document.getElementById('exitDefaultNode');
+        const current = {{ (settings.exit_nodes.default_exit_uid if settings.exit_nodes else '') | tojson }};
+        try {
+            const data = await (await fetch('/api/exit-nodes')).json();
+            (data.exit_nodes || []).forEach(node => {
+                const opt = document.createElement('option');
+                opt.value = node.uid;
+                opt.textContent = `${node.name} (${node.host}:${node.port || '?'})`;
+                if (node.uid === current) opt.selected = true;
+                select.appendChild(opt);
+            });
+        } catch (err) {
+            select.disabled = true;
+        }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
         loadTokens();
         loadTunnelStatus();
+        loadExitNodes();
         tunnelStatusTimer = setInterval(loadTunnelStatus, 10000);
     });
 </script>
