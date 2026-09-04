@@ -52,6 +52,10 @@ class ExitNodeUiWiringTests(unittest.TestCase):
         self.assertIn('id="exitLinkModal"', self.page)
         self.assertIn('id="exitPeersModal"', self.page)
         self.assertIn("if (err.message !== 'exit_in_use') throw err;", self.page)
+        # server-provided strings never reach innerHTML unescaped
+        peers_table = self.page[self.page.index('function showExitPeers'):self.page.index('function removeExitPeer')]
+        self.assertNotRegex(peers_table, r'\$\{p\.[a-z_]+( \|\| [^}]*)?\}')
+        self.assertIn("document.body.dataset.serverUid = {{ (server.uid or '') | tojson }};", self.page)
         self.assertIn("{ protocol: proto, force: true }", self.page)
 
     def test_translations_carry_every_ui_key_in_all_languages(self):

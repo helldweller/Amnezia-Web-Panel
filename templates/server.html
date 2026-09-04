@@ -1148,7 +1148,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
 <script>
     const SERVER_ID = {{ server_id }};
-    document.body.dataset.serverUid = "{{ server.uid or '' }}";
+    document.body.dataset.serverUid = {{ (server.uid or '') | tojson }};
     const SERVER_HOST = "{{ server.host }}";
     const MARKETPLACE_APPS = [
         { proto: 'awg3', category: 'protocols', icon: '🛡', title: 'AmneziaWG 3.1', descKey: 'awg3_desc', badge: 'NEW' },
@@ -1699,10 +1699,10 @@
             `;
         }
         if (base === 'exit') {
-            const key = info.public_key ? `<span title="${info.public_key}">${info.public_key.slice(0, 12)}…</span>` : '—';
+            const key = info.public_key ? `<span title="${escapeHtml(info.public_key)}">${escapeHtml(info.public_key.slice(0, 12))}…</span>` : '—';
             return `
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port || '—'}/UDP</span></div>
-                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_subnet')}</span><span class="protocol-info-value">${info.subnet || '—'}</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_subnet')}</span><span class="protocol-info-value">${escapeHtml(info.subnet || '—')}</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_peers')}</span><span class="protocol-info-value">${info.peers_count ?? 0}</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_obfuscation_short')}</span><span class="protocol-info-value">${info.obfuscation ? _('on') : _('off')}</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_public_key')}</span><span class="protocol-info-value">${key}</span></div>
@@ -1783,7 +1783,7 @@
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
                 }
                 if (!isService && info.exit_link) {
-                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('exit_link_via')}</span><span class="protocol-info-value">${info.exit_link.exit_name || ''} ${exitStatusBadge(info.exit_link_status, info.exit_link)}</span></div>`;
+                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('exit_link_via')}</span><span class="protocol-info-value">${escapeHtml(info.exit_link.exit_name || '')} ${exitStatusBadge(info.exit_link_status, info.exit_link)}</span></div>`;
                 }
                 infoGrid.innerHTML = grid;
             }
@@ -1848,7 +1848,7 @@
                         ? `<button class="btn btn-secondary btn-sm" onclick="openAwgSettings('${proto}')" title="${_('awg_settings_title')}">${_('awg_settings_btn')}</button>`
                         : '';
                     const exitBtn = AWG_PROTOCOLS.includes(protoBase(proto))
-                        ? `<button class="btn btn-secondary btn-sm" onclick="openExitLinkModal('${proto}')" title="${_('exit_link_title')}">🚪${info.exit_link ? ' ' + info.exit_link.exit_name : ''}</button>`
+                        ? `<button class="btn btn-secondary btn-sm" onclick="openExitLinkModal('${proto}')" title="${_('exit_link_title')}">🚪${info.exit_link ? ' ' + escapeHtml(info.exit_link.exit_name || '') : ''}</button>`
                         : '';
                     ctrlEl.innerHTML = `
                         ${awgBtn}
@@ -2427,7 +2427,7 @@
         'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'not_linked'];
 
     function exitStatusBadge(status, link) {
-        const badge = (cls, text, title = '') => `<span class="badge ${cls}" title="${title}"><span class="badge-dot"></span> ${text}</span>`;
+        const badge = (cls, text, title = '') => `<span class="badge ${cls}" title="${escapeHtml(title)}"><span class="badge-dot"></span> ${escapeHtml(text)}</span>`;
         if (link && link.stale) return badge('badge-danger', _('exit_status_down'), _('exit_link_stale'));
         if (!status) return badge('badge-secondary', _('exit_status_down'));
         if (status.error) return badge('badge-danger', _('exit_status_down'), status.error);
@@ -2451,6 +2451,7 @@
             const data = await apiCall(`/api/servers/${SERVER_ID}/exit/peers`, 'POST', { protocol: currentExitPeersProto });
             const info = data.info || {};
             infoEl.textContent = `${_('port')}: ${info.port || '—'}/UDP · ${_('exit_subnet')}: ${info.subnet || '—'} · ${_('exit_obfuscation_short')}: ${info.obfuscation ? _('on') : _('off')}`;
+            const e = escapeHtml;
             if (!data.peers || !data.peers.length) {
                 list.innerHTML = `<div class="empty-state">${_('exit_no_peers')}</div>`;
                 return;
@@ -2458,15 +2459,15 @@
             list.innerHTML = `<div class="table-wrap"><table class="table"><thead><tr>
                 <th>${_('exit_peer_name')}</th><th>${_('exit_transit_ip')}</th><th>${_('exit_public_key')}</th><th>${_('exit_handshake')}</th><th>${_('exit_transfer')}</th><th></th>
                 </tr></thead><tbody>` + data.peers.map(p => `<tr${p.external ? ' style="opacity:.7"' : ''}>
-                <td>${p.name || p.peer_id || '—'}${p.external ? ` <span class="badge badge-warn">${_('exit_peer_external')}</span>` : ''}</td>
-                <td>${p.transit_ip || '—'}</td>
-                <td><code title="${p.public_key}">${(p.public_key || '').slice(0, 12)}…</code></td>
-                <td>${p.latest_handshake || '—'}</td>
-                <td>${p.rx || '0 B'} ↓ ${p.tx || '0 B'} ↑</td>
-                <td><button class="btn btn-danger btn-sm" onclick="removeExitPeer('${p.public_key}')">${_('uninstall')}</button></td>
+                <td>${e(p.name || p.peer_id || '—')}${p.external ? ` <span class="badge badge-warn">${_('exit_peer_external')}</span>` : ''}</td>
+                <td>${e(p.transit_ip || '—')}</td>
+                <td><code title="${e(p.public_key)}">${e((p.public_key || '').slice(0, 12))}…</code></td>
+                <td>${e(p.latest_handshake || '—')}</td>
+                <td>${e(p.rx || '0 B')} ↓ ${e(p.tx || '0 B')} ↑</td>
+                <td><button class="btn btn-danger btn-sm" data-key="${e(p.public_key)}" onclick="removeExitPeer(this.dataset.key)">${_('uninstall')}</button></td>
                 </tr>`).join('') + `</tbody></table></div>`;
         } catch (err) {
-            list.innerHTML = `<div class="empty-state">${_('error')}: ${err.message}</div>`;
+            list.innerHTML = `<div class="empty-state">${_('error')}: ${escapeHtml(err.message)}</div>`;
         }
     }
 
@@ -2492,7 +2493,7 @@
         if (!link) {
             el.innerHTML = `<div class="form-hint">${_('exit_link_none')}</div>`;
         } else {
-            el.innerHTML = `<div>${_('exit_link_current').replace('{name}', link.exit_name || '').replace('{ip}', link.transit_ip || '')} ${exitStatusBadge(state.exit_link_status, link)}</div>`
+            el.innerHTML = `<div>${escapeHtml(_('exit_link_current').replace('{name}', link.exit_name || '').replace('{ip}', link.transit_ip || ''))} ${exitStatusBadge(state.exit_link_status, link)}</div>`
                 + (link.stale ? `<div class="form-hint" style="color:var(--danger, #f87171)">${_('exit_link_stale')}</div>` : '');
         }
         let warnings = '';
@@ -2536,7 +2537,7 @@
             document.getElementById('exitLinkBtn').disabled = !candidates.length;
             renderExitLinkState(state);
         } catch (err) {
-            document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('error')}: ${err.message}</div>`;
+            document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('error')}: ${escapeHtml(err.message)}</div>`;
         }
     }
 
