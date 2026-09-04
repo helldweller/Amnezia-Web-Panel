@@ -30,9 +30,10 @@ def base_data():
 
 
 class FakeAWG:
-    def __init__(self, host):
+    def __init__(self, host, events=None):
         self.host = host
         self.calls = []
+        self.events = events if events is not None else []
         self.mtu = '1376'
         self.ipv6 = ''
         self.link_error = None
@@ -51,6 +52,7 @@ class FakeAWG:
 
     def exit_link(self, protocol, link):
         self.calls.append(('exit_link', protocol, link))
+        self.events.append((self.host, 'exit_link'))
         if self.link_error:
             raise RuntimeError(self.link_error)
         return 'exit link up: 10.9.0.7/24 -> table 200'
@@ -69,15 +71,17 @@ class FakeAWG:
 
 
 class FakeExit:
-    def __init__(self, host):
+    def __init__(self, host, events=None):
         self.host = host
         self.calls = []
+        self.events = events if events is not None else []
         self.add_error = None
         self.remove_error = None
         self.next_ip = '10.9.0.7'
 
     def add_peer(self, peer_id, name, public_key):
         self.calls.append(('add_peer', peer_id, name, public_key))
+        self.events.append((self.host, 'add_peer'))
         if self.add_error:
             raise RuntimeError(self.add_error)
         return {'transit_ip': self.next_ip, 'psk': 'PSK', 'public_key': f'EXITPUB-{self.host}', 'port': '55520',
@@ -85,6 +89,7 @@ class FakeExit:
 
     def remove_peer(self, public_key=None, peer_id=None):
         self.calls.append(('remove_peer', public_key, peer_id))
+        self.events.append((self.host, 'remove_peer'))
         if self.remove_error:
             raise RuntimeError(self.remove_error)
         return True
@@ -99,6 +104,7 @@ class Harness:
         self.exits = {}
         self.unreachable = set()
         self.sleeps = []
+        self.events = []
 
         async def sleep(seconds):
             self.sleeps.append(seconds)
@@ -113,8 +119,8 @@ class Harness:
             save_data=self._save,
             data_lock=asyncio.Lock(),
             get_ssh=get_ssh,
-            awg_manager_factory=lambda host: self.awgs.setdefault(host, FakeAWG(host)),
-            exit_manager_factory=lambda host: self.exits.setdefault(host, FakeExit(host)),
+            awg_manager_factory=lambda host: self.awgs.setdefault(host, FakeAWG(host, self.events)),
+            exit_manager_factory=lambda host: self.exits.setdefault(host, FakeExit(host, self.events)),
             protocol_base=protocol_base,
             awg_protocols=AWG_PROTOCOLS,
             protocol_display_name=lambda p: {'awg2': 'AmneziaWG 2.0'}.get(p, p),
@@ -126,10 +132,10 @@ class Harness:
         self.data = copy.deepcopy(data)
 
     def awg(self, host='198.51.100.1'):
-        return self.awgs.setdefault(host, FakeAWG(host))
+        return self.awgs.setdefault(host, FakeAWG(host, self.events))
 
     def exit(self, host='203.0.113.5'):
-        return self.exits.setdefault(host, FakeExit(host))
+        return self.exits.setdefault(host, FakeExit(host, self.events))
 
     def record(self, server_idx=0, protocol='awg2'):
         return self.data['servers'][server_idx]['protocols'][protocol]
@@ -245,15 +251,42 @@ class LinkTests(unittest.TestCase):
         h.awg().ipv6 = 'fd42:8:1::1'
         self.assertTrue(run(h.service.link(0, 'awg2', 'exit-a'))['ipv6_refused'])
 
-    def test_switching_exits_drops_the_peer_on_the_old_one(self):
+    def test_switching_exits_drops_the_old_peer_only_after_the_new_link_is_confirmed(self):
         h = Harness()
         run(h.service.link(0, 'awg2', 'exit-a'))
-        h.data['servers'][0]['protocols']['awg_legacy'] = {'installed': True}  # keep legacy out of the way
+        h.events.clear()
         result = run(h.service.link(0, 'awg2', 'exit-b'))
         self.assertEqual(result['status'], 'success')
-        self.assertEqual(h.exit('203.0.113.5').calls[-1], ('remove_peer', None, 'entry-uid:awg2'))
-        self.assertEqual(h.exit('203.0.113.9').calls[0][0], 'add_peer')
+        self.assertEqual(h.events, [('203.0.113.9', 'add_peer'), ('198.51.100.1', 'exit_link'),
+                                    ('203.0.113.5', 'remove_peer')])
         self.assertEqual(h.record()['exit_link']['exit_uid'], 'exit-b')
+
+    def test_failed_switch_keeps_the_old_peer_and_marks_the_record_stale(self):
+        h = Harness()
+        run(h.service.link(0, 'awg2', 'exit-a'))
+        h.events.clear()
+        h.awg().link_error = 'apply failed'
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.link(0, 'awg2', 'exit-b'))
+        self.assertEqual(ctx.exception.code, 'exit_apply_failed')
+        # rollback touched the new exit and the entry, never the old exit
+        self.assertNotIn(('203.0.113.5', 'remove_peer'), h.events)
+        self.assertIn(('203.0.113.9', 'remove_peer'), h.events)
+        link = h.record()['exit_link']
+        self.assertEqual(link['exit_uid'], 'exit-a')
+        self.assertEqual(link['stale'], 'switch_failed')
+        # Repair goes back to the old exit, whose peer is still there
+        h.awg().link_error = None
+        self.assertEqual(run(h.service.relink_entry(0, 'awg2'))['exit_link']['exit_uid'], 'exit-a')
+        self.assertIsNone(h.record()['exit_link']['stale'])
+
+    def test_failed_relink_to_the_same_exit_marks_the_record_stale(self):
+        h = Harness()
+        run(h.service.link(0, 'awg2', 'exit-a'))
+        h.awg().link_error = 'apply failed'
+        with self.assertRaises(ExitLinkError):
+            run(h.service.link(0, 'awg2', 'exit-a', force=True))
+        self.assertEqual(h.record()['exit_link']['stale'], 'relink_failed')
 
     def test_switching_exits_tolerates_an_unreachable_old_exit(self):
         h = Harness()

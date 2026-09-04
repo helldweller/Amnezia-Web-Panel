@@ -182,14 +182,19 @@ class ExitLinkService:
                                     f'Client MTU {mtu} exceeds the link MTU {EXIT_MTU_LIMIT}; '
                                     f'lower it in the AWG settings or link anyway')
 
-            # Switching exits: drop our peer on the previous one, best effort.
-            if previous.get('exit_uid') and previous['exit_uid'] != exit_uid:
-                try:
-                    old_exit, _ = self._exit(data, previous['exit_uid'])
-                    await asyncio.to_thread(self._exit_manager(old_exit).remove_peer, None, peer_id)
-                except Exception as err:
-                    logger.warning("previous exit %s unreachable, peer left behind: %s", previous['exit_uid'], err)
-                    warnings.append('old_exit_unreachable_orphan_peer')
+            # The peer on a previous exit is dropped only after the new link is
+            # confirmed (below): until then the old exit is what Repair falls
+            # back to if this attempt has to be rolled back.
+            switching = bool(previous.get('exit_uid')) and previous['exit_uid'] != exit_uid
+
+            async def rolled_back():
+                # The rollback restored direct egress, so a saved link (to the
+                # previous exit or to this one) no longer describes reality.
+                await self._rollback(awg, protocol, exit_manager, peer_id)
+                if previous.get('exit_uid'):
+                    reason = 'switch_failed' if switching else 'relink_failed'
+                    await self._update_record(entry['uid'], protocol,
+                                              lambda r: (r.get('exit_link') or {}).__setitem__('stale', reason))
 
             exit_manager = self._exit_manager(exit_srv)
             name = f"{entry.get('name') or entry.get('host', '')} / {self.protocol_display_name(protocol)}"
@@ -210,18 +215,27 @@ class ExitLinkService:
             try:
                 log.append(await asyncio.to_thread(awg.exit_link, protocol, link))
             except Exception as err:
-                await self._rollback(awg, protocol, exit_manager, peer_id)
+                await rolled_back()
                 raise ExitLinkError('exit_apply_failed', str(err))
 
             handshake = await self._wait_handshake(awg, protocol)
             if not handshake:
                 if not force:
-                    await self._rollback(awg, protocol, exit_manager, peer_id)
+                    await rolled_back()
                     raise ExitLinkError('exit_no_handshake',
                                         f"No handshake from the exit node within {HANDSHAKE_WAIT_SECONDS} s "
                                         f"(is {link['endpoint_port']}/udp reachable on {link['endpoint_host']}?). "
                                         f"The link was rolled back")
                 warnings.append('no_handshake_yet')
+
+            if switching:
+                # New link confirmed: drop our peer on the previous exit, best effort.
+                try:
+                    old_exit, _ = self._exit(data, previous['exit_uid'])
+                    await asyncio.to_thread(self._exit_manager(old_exit).remove_peer, None, peer_id)
+                except Exception as err:
+                    logger.warning("previous exit %s unreachable, peer left behind: %s", previous['exit_uid'], err)
+                    warnings.append('old_exit_unreachable_orphan_peer')
 
             record = {
                 'exit_uid': exit_uid,
