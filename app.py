@@ -950,6 +950,14 @@ def backfill_server_uids(servers) -> bool:
     return changed
 
 
+def should_link_default_exit(default_uid, server_uid, is_awg, reinstall, previous_link):
+    """Whether a just-installed instance should join the default exit node:
+    only a newly added AWG instance on another server, and only when nothing
+    (a link of its own, or an earlier deliberate unlink) already speaks for it."""
+    return bool(default_uid) and is_awg and not reinstall and not previous_link \
+        and default_uid != server_uid
+
+
 def find_server_by_uid(data, uid):
     """Return (index, server) for a stable server uid, or (None, None) when the
     uid is empty or unknown. Index-based server_id values shift on reorder and
@@ -3375,6 +3383,9 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         install_base = protocol_base(install_protocol)
         # A reinstalled entry keeps its exit link and is re-linked below
         previous_link = None
+        # Reinstalling an instance is not the same as adding one: an instance a
+        # user deliberately left unlinked must not be linked behind their back.
+        reinstall = install_protocol in (server.get('protocols') or {})
         if install_base in AWG_PROTOCOLS:
             previous_link = ((server.get('protocols') or {}).get(install_protocol) or {}).get('exit_link')
 
@@ -3511,8 +3522,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
 
         # A new AWG instance joins the default exit node, when one is set.
         default_uid = ((data.get('settings', {}).get('exit_nodes') or {}).get('default_exit_uid') or '').strip()
-        if (install_base in AWG_PROTOCOLS and not previous_link
-                and default_uid and default_uid != server.get('uid')):
+        if should_link_default_exit(default_uid, server.get('uid'), install_base in AWG_PROTOCOLS,
+                                    reinstall, previous_link):
             try:
                 linked = await exit_link_svc.link(server_id, install_protocol, default_uid)
                 result.setdefault('log', []).append(

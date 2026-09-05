@@ -8,6 +8,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 import app as panel
+from app import should_link_default_exit
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,6 +31,34 @@ SETTINGS_PAYLOAD = {
     'telegram': {'token': '', 'enabled': False},
     'ssl': {'enabled': False},
 }
+
+
+class AutoLinkDecisionTests(unittest.TestCase):
+    """Which installs join the default exit node."""
+
+    def decide(self, **kw):
+        args = dict(default_uid='exit-uid', server_uid='entry-uid', is_awg=True,
+                    reinstall=False, previous_link=None)
+        args.update(kw)
+        return should_link_default_exit(args['default_uid'], args['server_uid'], args['is_awg'],
+                                        args['reinstall'], args['previous_link'])
+
+    def test_a_newly_added_awg_instance_joins(self):
+        self.assertTrue(self.decide())
+
+    def test_reinstalling_an_unlinked_instance_stays_unlinked(self):
+        # the instance was deliberately left (or set) unlinked - a reinstall
+        # must not route its clients through the default exit behind our back
+        self.assertFalse(self.decide(reinstall=True))
+
+    def test_an_instance_with_its_own_link_is_left_to_the_relink_path(self):
+        self.assertFalse(self.decide(reinstall=True, previous_link={'exit_uid': 'other'}))
+        self.assertFalse(self.decide(previous_link={'exit_uid': 'other'}))
+
+    def test_no_default_no_self_link_no_other_protocols(self):
+        self.assertFalse(self.decide(default_uid=''))
+        self.assertFalse(self.decide(server_uid='exit-uid'))   # the exit's own server
+        self.assertFalse(self.decide(is_awg=False))
 
 
 class DefaultExitNodeSettingsTests(unittest.TestCase):
