@@ -108,6 +108,17 @@ class DefaultExitNodeSettingsTests(unittest.TestCase):
     def test_settings_default_is_present_for_old_data_files(self):
         self.assertEqual(panel.load_data()['settings']['exit_nodes'], {'default_exit_uid': ''})
 
+    def test_settings_page_renders_the_exit_card(self):
+        with TestClient(panel.app) as client:
+            login = client.post('/api/auth/login', json={'username': 'admin', 'password': 'admin'})
+            self.assertEqual(login.status_code, 200, login.text)
+            page = client.get('/settings')
+            self.assertEqual(page.status_code, 200, page.text)
+            for marker in ('id="exitDefaultNode"', 'loadExitNodes()', 'Default exit node'):
+                self.assertIn(marker, page.text, f'/settings lacks {marker}')
+            # the stored uid reaches the page as JSON, not as raw interpolation
+            self.assertIn('const current = ""', page.text)
+
     def test_settings_page_wiring(self):
         with open(os.path.join(ROOT, 'templates', 'settings.html'), encoding='utf-8') as f:
             page = f.read()
