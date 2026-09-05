@@ -8,6 +8,7 @@ available (it is on the CI image; the test skips without it).
 """
 
 import glob
+import json
 import os
 import re
 import shutil
@@ -27,6 +28,30 @@ def inline_js(html):
     js = '\n'.join(INLINE_SCRIPT_RE.findall(html))
     js = re.sub(r'\{\{.*?\}\}', 'JINJA', js, flags=re.S)
     return re.sub(r'\{%.*?%\}', '', js, flags=re.S)
+
+
+class TranslationFileTests(unittest.TestCase):
+    """The same class of silent breakage on the data side: merging two branches
+    that both appended keys can drop the comma between the blocks, and a
+    translation file that no longer parses only shows up as raw keys in the UI
+    (the loader logs the error and serves an empty table)."""
+
+    def test_every_translation_file_parses(self):
+        files = sorted(glob.glob(os.path.join(ROOT, 'translations', '*.json')))
+        self.assertGreaterEqual(len(files), 5, f'only found {files}')
+        tables = {}
+        for path in files:
+            name = os.path.basename(path)
+            with open(path, encoding='utf-8') as f:
+                try:
+                    tables[name] = json.load(f)
+                except json.JSONDecodeError as err:
+                    self.fail(f'{name} does not parse: {err}')
+            self.assertGreater(len(tables[name]), 400, f'{name} looks truncated')
+        # english is the fallback every other language is filled from
+        for name, table in tables.items():
+            extra = sorted(set(table) - set(tables['en.json']))
+            self.assertEqual(extra, [], f'{name} has keys en.json does not: {extra}')
 
 
 @unittest.skipUnless(shutil.which('node'), 'node is not installed')
