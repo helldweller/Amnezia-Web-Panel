@@ -529,5 +529,13 @@
   "old_exit_unreachable_orphan_peer": "The previous exit node was unreachable; its peer entry was left behind.",
   "exit_unreachable_orphan_peer": "The exit node was unreachable; its peer entry was left behind.",
   "on": "on",
-  "off": "off"
+  "off": "off",
+  "restore": "Restore",
+  "restore_confirm_protocol": "Are you sure? The current protocol configuration will be overwritten with this backup.",
+  "restore_success": "Backup restored successfully!",
+  "delete_backup_confirm": "Delete this backup from the server? This cannot be undone.",
+  "backup_deleted": "Backup deleted",
+  "upload_backup": "Upload",
+  "uploading_backup": "Uploading...",
+  "backup_uploaded": "Backup uploaded"
 }

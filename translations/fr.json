@@ -496,5 +496,13 @@
   "old_exit_unreachable_orphan_peer": "The previous exit node was unreachable; its peer entry was left behind.",
   "exit_unreachable_orphan_peer": "The exit node was unreachable; its peer entry was left behind.",
   "on": "on",
-  "off": "off"
+  "off": "off",
+  "restore": "Restaurer",
+  "restore_confirm_protocol": "Êtes-vous sûr ? La configuration actuelle du protocole sera écrasée par cette sauvegarde.",
+  "restore_success": "Sauvegarde restaurée avec succès !",
+  "delete_backup_confirm": "Supprimer cette sauvegarde du serveur ? Cette action est irréversible.",
+  "backup_deleted": "Sauvegarde supprimée",
+  "upload_backup": "Téléverser",
+  "uploading_backup": "Téléversement...",
+  "backup_uploaded": "Sauvegarde téléversée"
 }

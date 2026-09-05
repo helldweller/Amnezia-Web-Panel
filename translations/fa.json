@@ -496,5 +496,13 @@
   "old_exit_unreachable_orphan_peer": "The previous exit node was unreachable; its peer entry was left behind.",
   "exit_unreachable_orphan_peer": "The exit node was unreachable; its peer entry was left behind.",
   "on": "on",
-  "off": "off"
+  "off": "off",
+  "restore": "بازیابی",
+  "restore_confirm_protocol": "آیا مطمئن هستید؟ پیکربندی فعلی پروتکل با این پشتیبان جایگزین خواهد شد.",
+  "restore_success": "بازیابی پشتیبان با موفقیت انجام شد!",
+  "delete_backup_confirm": "این پشتیبان از سرور حذف شود؟ این عمل قابل بازگشت نیست.",
+  "backup_deleted": "پشتیبان حذف شد",
+  "upload_backup": "بارگذاری",
+  "uploading_backup": "در حال بارگذاری...",
+  "backup_uploaded": "پشتیبان بارگذاری شد"
 }
