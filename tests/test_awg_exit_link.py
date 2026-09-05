@@ -290,6 +290,48 @@ class ExitEgressCheckTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.manager.exit_check_egress('awg2')
         self.assertIn('No such container', str(ctx.exception))
+class ExitDnsViaExitTests(unittest.TestCase):
+    def setUp(self):
+        self.ssh = RecordingSSH()
+        self.manager = AWGManager(self.ssh)
+
+    def test_toggle_rewrites_the_marker_and_reapplies(self):
+        self.ssh.answers['_amnz_exit.sh'] = ('exit link up: 10.9.0.7/24 -> table 200', '', 0)
+        out = self.manager.exit_set_dns_via_exit('awg2', True)
+        self.assertEqual(out, 'exit link up: 10.9.0.7/24 -> table 200')
+        sed = next(c for c in self.ssh.commands if 'DnsViaExit' in c)
+        self.assertIn(f'sed -i "s|^# DnsViaExit = .*|# DnsViaExit = on|" {EXIT_CONF}', sed)
+        self.assertIn(f'test -f {EXIT_CONF} || exit 9', sed)
+        # the same block that runs at container start puts the rules back
+        self.assertTrue(self.ssh.uploads['/tmp/_amnz_exit.sh'].endswith('x_exit_sync\n'))
+
+        self.manager.exit_set_dns_via_exit('awg2', False)
+        self.assertIn('# DnsViaExit = off|', [c for c in self.ssh.commands if 'DnsViaExit' in c][-1])
+
+    def test_toggle_without_a_link_file_raises(self):
+        self.ssh.answers['DnsViaExit'] = ('', '', 9)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.manager.exit_set_dns_via_exit('awg2', True)
+        self.assertIn('no exit link file', str(ctx.exception))
+
+    def test_dns_exception_rule_follows_the_marker(self):
+        block = AWGManager._exit_shell_functions('/opt/amnezia/awg/awg0.conf', 'awg-quick', '10.8.1.1/24')
+        # on -> the DNS exception is removed, off -> it is (re)installed
+        self.assertIn("if grep -qs '^# DnsViaExit = on' \"$EXIT_CONF\"; then x_unrule -4 191", block)
+        self.assertIn('x_rule -4 191 from $X_SUBNET to $DNS_NET lookup main', block)
+
+    def test_awg_settings_report_the_link_ceiling(self):
+        self.ssh.answers['ExitUid|ExitName'] = (
+            '# ExitUid = abc123\n# ExitName = Berlin-1\n# Obfuscation = off\n# DnsViaExit = on\n'
+            'Address = 10.9.0.7/24\nEndpoint = 203.0.113.5:55520\n', '', 0)
+        self.ssh.answers['cat /opt/amnezia/awg/awg0.conf'] = (
+            '[Interface]\nAddress = 10.8.1.1/24\n# MTU = 1376\n', '', 0)
+        settings = self.manager.get_awg_settings('awg2')
+        self.assertTrue(settings['exit_linked'])
+        self.assertEqual(settings['exit_mtu'], 1420)
+
+        self.ssh.answers['ExitUid|ExitName'] = ('', '', 9)
+        self.assertFalse(self.manager.get_awg_settings('awg2')['exit_linked'])
 
 
 if __name__ == '__main__':

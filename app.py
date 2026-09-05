@@ -2049,6 +2049,11 @@ class ExitLinkRequest(BaseModel):
     force: Optional[bool] = False
 
 
+class ExitDnsRequest(BaseModel):
+    protocol: str = 'awg'
+    enabled: bool = False
+
+
 class Socks5SettingsRequest(BaseModel):
     protocol: str = 'socks5'
     port: Optional[int] = None
@@ -3721,6 +3726,21 @@ async def api_exit_relink(request: Request, server_id: int, req: ProtocolRequest
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/exit-link/dns', tags=["Protocols"])
+async def api_exit_link_dns(request: Request, server_id: int, req: ExitDnsRequest):
+    """Resolve client DNS at the exit node instead of this one (requires
+    AmneziaDNS on the exit)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.set_dns_via_exit(server_id, req.protocol, req.enabled)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error switching the DNS route of an exit link")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/exit-link/status', tags=["Protocols"])
 async def api_exit_link_status(request: Request, server_id: int, req: ProtocolRequest):
     """Saved link plus live handshake/transfer, client MTU and IPv6 flags."""
@@ -3856,6 +3876,11 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if base == 'exit':
             detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
             return {'status': 'success', 'detached': detached}
+        if base == 'dns':
+            # queries sent here through a link would go nowhere now
+            restored = await exit_link_svc.disable_dns_via_exit_for_exit(server.get('uid'))
+            if restored:
+                return {'status': 'success', 'dns_restored': restored}
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error uninstalling protocol")

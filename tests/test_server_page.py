@@ -68,10 +68,21 @@ class ExitNodeUiWiringTests(unittest.TestCase):
         # the probed address comes from the server, so it is escaped
         body = self.page[self.page.index('function checkExitEgress'):self.page.index('async function repairExitLink')]
         self.assertNotRegex(body, r'\$\{r\.[a-z_]+( \|\| [^}]*)?\}')
+    def test_dns_via_exit_toggle_and_mtu_hint(self):
+        self.assertIn('id="exitDnsGroup"', self.page)
+        self.assertIn('id="exitDnsViaExit"', self.page)
+        self.assertRegex(self.page, r"function saveExitDns\(")
+        self.assertIn("exit-link/dns", self.page)
+        # the toggle belongs to a linked instance only
+        self.assertIn("document.getElementById('exitDnsGroup').classList.toggle('hidden', !link);", self.page)
+        # AWG settings warn about the link ceiling
+        self.assertIn('id="awgSetMtuExitHint"', self.page)
+        self.assertIn("_('awg_mtu_exit_hint').replace('{exit_mtu}', data.exit_mtu)", self.page)
 
     def test_translations_carry_every_ui_key_in_all_languages(self):
         keys = set(re.findall(r"_\('(exit_[a-z0-9_]+)'\)", self.page))
         keys |= set(re.findall(r"\{\{ _\('(exit_[a-z0-9_]+)'\) \}\}", self.page))
+        keys |= {'exit_dns_disabled_no_dns'}   # rendered through _(w) from the API warnings
         self.assertGreater(len(keys), 20)
         for lang in ('en', 'ru', 'fr', 'fa', 'zh'):
             data = json.loads(read('translations', f'{lang}.json'))
