@@ -41,6 +41,7 @@ class FakeAWG:
         self.fail_unlink = False
         self.egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
         self.egress_error = None
+        self.endpoint = '203.0.113.5:55520'
 
     def exit_prepare_keys(self, protocol):
         self.calls.append(('exit_prepare_keys', protocol))
@@ -63,7 +64,7 @@ class FakeAWG:
         self.calls.append(('exit_link_status', protocol))
         if self.status_sequence:
             return self.status_sequence.pop(0)
-        return {'up': True, 'handshake_age': 3, 'rx_bytes': 1, 'tx_bytes': 2, 'endpoint': 'x'}
+        return {'up': True, 'handshake_age': 3, 'rx_bytes': 1, 'tx_bytes': 2, 'endpoint': self.endpoint}
 
     def exit_check_egress(self, protocol):
         self.calls.append(('exit_check_egress', protocol))
@@ -407,7 +408,7 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
     def test_check_egress_matches_the_exit_address(self):
         h = self.linked()
         result = run(h.service.check_egress(0, 'awg2'))
-        self.assertEqual(('exit_check_egress', 'awg2'), h.awg().calls[-1])
+        self.assertIn(('exit_check_egress', 'awg2'), h.awg().calls)
         self.assertTrue(result['matches'])
         self.assertFalse(result['leaks'])
         self.assertEqual(result['expected'], '203.0.113.5')
@@ -430,6 +431,28 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
         blind = run(h.service.check_egress(0, 'awg2'))
         self.assertFalse(blind['matches'])
         self.assertFalse(blind['leaks'])
+
+    def test_check_egress_compares_against_the_resolved_endpoint(self):
+        # a server added by hostname: the probe answers with an address, so the
+        # comparison uses the endpoint WireGuard resolved that hostname to
+        h = self.linked()
+        h.data['servers'][1]['host'] = 'exit.example.com'
+        run(h.service.relink_entry(0, 'awg2'))
+        h.awg().status_sequence = None
+        h.awg().egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
+        h.awg().endpoint = '203.0.113.5:55520'
+        result = run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(result['expected'], 'exit.example.com')
+        self.assertEqual(result['expected_ip'], '203.0.113.5')
+        self.assertTrue(result['matches'])
+
+        # no live endpoint and a hostname to compare with: not a match, but the
+        # clients are provably not leaving from the entry either
+        h.awg().endpoint = ''
+        unresolved = run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(unresolved['expected_ip'], '')
+        self.assertFalse(unresolved['matches'])
+        self.assertFalse(unresolved['leaks'])
 
     def test_check_egress_requires_a_link_and_maps_failures(self):
         h = Harness()

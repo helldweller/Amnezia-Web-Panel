@@ -2689,7 +2689,7 @@
             } else if (r.matches) {
                 text = _('exit_egress_match').replace('{ip}', via).replace('{name}', escapeHtml(r.exit_name || '')); color = 'var(--success, #4ade80)';
             } else {
-                text = _('exit_egress_mismatch').replace('{ip}', via).replace('{expected}', escapeHtml(r.expected || '')); color = 'var(--warning, #fbbf24)';
+                text = _('exit_egress_mismatch').replace('{ip}', via).replace('{expected}', escapeHtml(r.expected_ip || r.expected || '')); color = 'var(--warning, #fbbf24)';
             }
             box.innerHTML = `<div class="form-hint" style="color:${color}">${text}</div>`;
         } catch (err) {
