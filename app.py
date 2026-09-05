@@ -193,6 +193,7 @@ def load_data():
         'remnawave_protocol': 'awg'
     })
     settings.setdefault('captcha', {'enabled': False})
+    settings.setdefault('exit_nodes', {'default_exit_uid': ''})
     settings.setdefault('telegram', {'token': '', 'enabled': False})
     settings.setdefault('ssl', {
         'enabled': False,
@@ -947,6 +948,14 @@ def backfill_server_uids(servers) -> bool:
             server['uid'] = uuid.uuid4().hex
             changed = True
     return changed
+
+
+def should_link_default_exit(default_uid, server_uid, is_awg, reinstall, previous_link):
+    """Whether a just-installed instance should join the default exit node:
+    only a newly added AWG instance on another server, and only when nothing
+    (a link of its own, or an earlier deliberate unlink) already speaks for it."""
+    return bool(default_uid) and is_awg and not reinstall and not previous_link \
+        and default_uid != server_uid
 
 
 def find_server_by_uid(data, uid):
@@ -2220,6 +2229,10 @@ class UpdateUserRequest(BaseModel):
 
 
 
+class ExitNodesSettings(BaseModel):
+    default_exit_uid: str = ''
+
+
 class SaveSettingsRequest(BaseModel):
     appearance: AppearanceSettings
     sync: SyncSettings
@@ -2228,6 +2241,7 @@ class SaveSettingsRequest(BaseModel):
     ssl: SSLSettings
     auto_backup: AutoBackupSettings = AutoBackupSettings()
     self_service: SelfServiceSettings = SelfServiceSettings()
+    exit_nodes: ExitNodesSettings = ExitNodesSettings()
 
 
 class ToggleUserRequest(BaseModel):
@@ -3369,6 +3383,9 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         install_base = protocol_base(install_protocol)
         # A reinstalled entry keeps its exit link and is re-linked below
         previous_link = None
+        # Reinstalling an instance is not the same as adding one: an instance a
+        # user deliberately left unlinked must not be linked behind their back.
+        reinstall = install_protocol in (server.get('protocols') or {})
         if install_base in AWG_PROTOCOLS:
             previous_link = ((server.get('protocols') or {}).get(install_protocol) or {}).get('exit_link')
 
@@ -3502,6 +3519,19 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         result['container_name'] = proto_record['container_name']
         save_data(data)
         ssh.disconnect()
+
+        # A new AWG instance joins the default exit node, when one is set.
+        default_uid = ((data.get('settings', {}).get('exit_nodes') or {}).get('default_exit_uid') or '').strip()
+        if should_link_default_exit(default_uid, server.get('uid'), install_base in AWG_PROTOCOLS,
+                                    reinstall, previous_link):
+            try:
+                linked = await exit_link_svc.link(server_id, install_protocol, default_uid)
+                result.setdefault('log', []).append(
+                    f"Linked to the default exit node {linked['exit_link']['exit_name']}")
+            except Exception as e:
+                # the instance is installed either way; the link is an extra
+                logger.warning(f"default exit link after install failed: {e}")
+                result.setdefault('log', []).append(f"! Could not link to the default exit node: {e}")
 
         # Exit-node links survive reinstalls: bring them back now.
         if install_base == 'exit':
@@ -5307,6 +5337,15 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     self_service = payload.self_service.dict()
     self_service['allowed_protocols'] = sanitize_allowed_protocols(self_service.get('allowed_protocols'))
     settings['self_service'] = self_service
+
+    warnings = []
+    default_exit_uid = (payload.exit_nodes.default_exit_uid or '').strip()
+    if default_exit_uid and not any(n['uid'] == default_exit_uid
+                                    for n in exit_link_svc.list_exit_nodes(data)):
+        # the node was uninstalled or deleted between opening and saving
+        default_exit_uid = ''
+        warnings.append('exit_default_cleared')
+    settings['exit_nodes'] = {'default_exit_uid': default_exit_uid}
     save_data(data)
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 
@@ -5321,7 +5360,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
             logger.info("Stopping Telegram bot (settings save)...")
             asyncio.create_task(tg_bot.stop_bot())
 
-    return {"status": "success", "bot_running": tg_bot.is_running()}
+    return {"status": "success", "bot_running": tg_bot.is_running(), "warnings": warnings}
 
 
 @app.post('/api/settings/telegram/toggle', tags=["Settings"])
