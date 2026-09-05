@@ -12,6 +12,7 @@ tested with fake managers and an in-memory data.json.
 
 import asyncio
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime
 
@@ -29,6 +30,9 @@ class ExitLinkError(Exception):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+
+
+IPV4_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 
 
 def peer_id_for(entry_uid, protocol):
@@ -331,6 +335,49 @@ class ExitLinkService:
                 logger.warning("could not drop peer for %s on exit %s: %s", proto, link['exit_uid'], err)
                 results.append({'protocol': proto, 'exit_uid': link['exit_uid'], 'status': 'error', 'error': str(err)})
         return results
+
+    @staticmethod
+    def _endpoint_ip(status):
+        """IPv4 of the live `host:port` endpoint of the link, or '' (an IPv6
+        endpoint has no bearing on the IPv4-only egress probe)."""
+        endpoint = (status or {}).get('endpoint') or ''
+        host = endpoint.rsplit(':', 1)[0]
+        return host if IPV4_RE.match(host) else ''
+
+    async def check_egress(self, entry_server_id, protocol):
+        """Ask the entry container which public IP its clients leave from and
+        compare it with the exit node's address. `leaks` means the clients
+        still leave from the entry node itself."""
+        data = self.load_data()
+        entry, rec = self._entry(data, entry_server_id, protocol)
+        link = rec.get('exit_link')
+        if not link:
+            raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
+        awg = self._awg(entry)
+        try:
+            probe = await asyncio.to_thread(awg.exit_check_egress, protocol)
+        except RuntimeError as err:
+            raise ExitLinkError('exit_egress_failed', str(err))
+        via, direct = probe.get('via_exit', ''), probe.get('direct', '')
+        expected = link.get('endpoint_host', '')
+        # `endpoint_host` is whatever the admin typed when adding the server and
+        # is often a hostname; the probe always answers with an address. The
+        # live WireGuard endpoint is the resolved form of that same host, so it
+        # is what the comparison uses when available.
+        status = await asyncio.to_thread(awg.exit_link_status, protocol)
+        expected_ip = self._endpoint_ip(status) or (expected if IPV4_RE.match(expected or '') else '')
+        return {
+            'status': 'success',
+            'via_exit': via,
+            'direct': direct,
+            'expected': expected,
+            'expected_ip': expected_ip,
+            'exit_name': link.get('exit_name', ''),
+            # A NATed exit answers from another address, so a mismatch is a
+            # warning, not a failure; leaving from the entry address is not.
+            'matches': bool(via) and bool(expected_ip) and via == expected_ip,
+            'leaks': bool(via) and via == direct,
+        }
 
     async def status(self, entry_server_id, protocol):
         data = self.load_data()

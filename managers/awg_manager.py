@@ -115,6 +115,14 @@ EXIT_HANDSHAKE_UP_SECONDS = 300  # REJECT_AFTER_TIME (180) + keepalive slack; 18
 DNS_NET = '172.29.172.0/24'      # amnezia-dns-net: AmneziaDNS / AdGuard live here, reached via eth1
 ENTRY_PRIVATE_KEY_PLACEHOLDER = '__ENTRY_PRIVATE_KEY__'
 
+# Egress check: the container asks a public "what is my IP" service twice -
+# once bound to the tunnel gateway (that source address is what policy routing
+# sends through exit0, i.e. exactly the client path) and once unbound. Two
+# services, so a single one being down does not read as "no egress".
+EGRESS_CHECK_URLS = ('https://api.ipify.org', 'https://ifconfig.me/ip')
+EGRESS_CHECK_TIMEOUT = 8
+IPV4_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
 # Obfuscation keys carried on a transit link (exit node <-> entry node). S3/S4
 # pad every cookie/transport packet and would eat the MTU budget of a tunnel
 # inside a tunnel, so only the handshake-side keys are used on that hop.
@@ -1661,6 +1669,46 @@ x_exit_sync() {
             'tx_bytes': peer.get('tx_bytes', 0),
             'endpoint': peer.get('endpoint', ''),
         }
+
+    @staticmethod
+    def _egress_probe_script(subnet_ip):
+        """POSIX sh (single-quoted into `docker exec sh -c`, so no quotes of
+        its own) printing the client-path egress IP, `---`, and the container's
+        own egress IP."""
+        urls = ' '.join(EGRESS_CHECK_URLS)
+        probe = (
+            'x_ip() { for u in %s; do '
+            'r=$(curl -fsS -4 --max-time %d "$@" "$u" 2>/dev/null | tr -d "[:space:]"); '
+            'case "$r" in ""|*[!0-9.]*) ;; *) echo "$r"; return 0;; esac; '
+            'done; echo ""; }' % (urls, EGRESS_CHECK_TIMEOUT)
+        )
+        return f'{probe}; x_ip --interface {subnet_ip}; echo ---; x_ip'
+
+    @staticmethod
+    def _first_ipv4(text):
+        """First line of `text` that is a bare IPv4 address, or ''."""
+        for line in (text or '').split('\n'):
+            line = line.strip()
+            if IPV4_RE.match(line):
+                return line
+        return ''
+
+    def exit_check_egress(self, protocol_type):
+        """Which public IP the clients of this instance leave from, and which
+        one this node leaves from. The client probe is bound to the tunnel
+        gateway address, so it takes the client path (ip rule -> table 200 ->
+        exit0) instead of the container's default route; when no link is up it
+        simply reports the node's own address twice."""
+        container_name = self._container_name(protocol_type)
+        script = self._egress_probe_script(self._get_subnet_ip(protocol_type))
+        # both probes may fall through every URL before giving up
+        timeout = EGRESS_CHECK_TIMEOUT * len(EGRESS_CHECK_URLS) * 2 + 20
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c '{script}'", timeout=timeout)
+        if code != 0:
+            raise RuntimeError(f"Egress check failed: {(err or out).strip()}")
+        via, _, direct = out.partition('---')
+        return {'via_exit': self._first_ipv4(via), 'direct': self._first_ipv4(direct)}
 
     def remove_container(self, protocol_type):
         """Remove AWG container (mirrors remove_container.sh)."""

@@ -39,6 +39,9 @@ class FakeAWG:
         self.link_error = None
         self.status_sequence = None       # list of exit_link_status answers
         self.fail_unlink = False
+        self.egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
+        self.egress_error = None
+        self.endpoint = '203.0.113.5:55520'
 
     def exit_prepare_keys(self, protocol):
         self.calls.append(('exit_prepare_keys', protocol))
@@ -61,7 +64,13 @@ class FakeAWG:
         self.calls.append(('exit_link_status', protocol))
         if self.status_sequence:
             return self.status_sequence.pop(0)
-        return {'up': True, 'handshake_age': 3, 'rx_bytes': 1, 'tx_bytes': 2, 'endpoint': 'x'}
+        return {'up': True, 'handshake_age': 3, 'rx_bytes': 1, 'tx_bytes': 2, 'endpoint': self.endpoint}
+
+    def exit_check_egress(self, protocol):
+        self.calls.append(('exit_check_egress', protocol))
+        if self.egress_error:
+            raise RuntimeError(self.egress_error)
+        return dict(self.egress)
 
     def exit_unlink(self, protocol):
         self.calls.append(('exit_unlink', protocol))
@@ -395,6 +404,67 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
         self.assertEqual(h.service.linked_entries(h.data, 'exit-a'),
                          [{'server_id': 0, 'server_uid': 'entry-uid', 'name': 'Paris', 'protocol': 'awg2', 'stale': None}])
         self.assertEqual(h.service.linked_entries(h.data, ''), [])
+
+    def test_check_egress_matches_the_exit_address(self):
+        h = self.linked()
+        result = run(h.service.check_egress(0, 'awg2'))
+        self.assertIn(('exit_check_egress', 'awg2'), h.awg().calls)
+        self.assertTrue(result['matches'])
+        self.assertFalse(result['leaks'])
+        self.assertEqual(result['expected'], '203.0.113.5')
+        self.assertEqual(result['exit_name'], 'Berlin-1')
+
+    def test_check_egress_flags_a_leak_and_a_natted_exit(self):
+        h = self.linked()
+        # clients still leave from the entry node
+        h.awg().egress = {'via_exit': '198.51.100.1', 'direct': '198.51.100.1'}
+        leaking = run(h.service.check_egress(0, 'awg2'))
+        self.assertTrue(leaking['leaks'])
+        self.assertFalse(leaking['matches'])
+        # a NATed exit answers from another address: neither a match nor a leak
+        h.awg().egress = {'via_exit': '203.0.113.77', 'direct': '198.51.100.1'}
+        natted = run(h.service.check_egress(0, 'awg2'))
+        self.assertFalse(natted['matches'])
+        self.assertFalse(natted['leaks'])
+        # nothing answered at all
+        h.awg().egress = {'via_exit': '', 'direct': ''}
+        blind = run(h.service.check_egress(0, 'awg2'))
+        self.assertFalse(blind['matches'])
+        self.assertFalse(blind['leaks'])
+
+    def test_check_egress_compares_against_the_resolved_endpoint(self):
+        # a server added by hostname: the probe answers with an address, so the
+        # comparison uses the endpoint WireGuard resolved that hostname to
+        h = self.linked()
+        h.data['servers'][1]['host'] = 'exit.example.com'
+        run(h.service.relink_entry(0, 'awg2'))
+        h.awg().status_sequence = None
+        h.awg().egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
+        h.awg().endpoint = '203.0.113.5:55520'
+        result = run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(result['expected'], 'exit.example.com')
+        self.assertEqual(result['expected_ip'], '203.0.113.5')
+        self.assertTrue(result['matches'])
+
+        # no live endpoint and a hostname to compare with: not a match, but the
+        # clients are provably not leaving from the entry either
+        h.awg().endpoint = ''
+        unresolved = run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(unresolved['expected_ip'], '')
+        self.assertFalse(unresolved['matches'])
+        self.assertFalse(unresolved['leaks'])
+
+    def test_check_egress_requires_a_link_and_maps_failures(self):
+        h = Harness()
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(ctx.exception.code, 'not_linked')
+
+        h = self.linked()
+        h.awg().egress_error = 'No such container: amnezia-awg2'
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.check_egress(0, 'awg2'))
+        self.assertEqual(ctx.exception.code, 'exit_egress_failed')
 
     def test_peer_id_format(self):
         self.assertEqual(peer_id_for('abc', 'awg2'), 'abc:awg2')
