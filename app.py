@@ -4120,6 +4120,14 @@ async def api_protocol_backup_restore(request: Request, server_id: int, req: Bac
         result = BackupManager(ssh).restore_backup(req.protocol, container, filename)
         if result.get('status') == 'error':
             return JSONResponse({'error': result.get('message', 'Failed to restore backup')}, status_code=500)
+        ssh.disconnect()
+        ssh = None
+        # The archive owns the files an exit link lives in, so the restored
+        # container and data.json can now disagree. Never fails the restore.
+        try:
+            result.update(await exit_link_svc.reconcile_after_restore(server_id, req.protocol))
+        except Exception as e:
+            logger.warning(f"exit-link reconcile after restore failed: {e}")
         return result
     except Exception as e:
         logger.exception("Error restoring protocol backup")

@@ -359,6 +359,59 @@ class ExitLinkService:
                 results.append({**item, 'status': 'error', 'error': str(err)})
         return results
 
+    async def reconcile_after_restore(self, server_id, protocol):
+        """A protocol restore overwrites the very files a link lives in: the
+        entry keeps exit0.conf inside its AWG config directory, the exit keeps
+        its peer table. So an archive can bring back a link the panel does not
+        know about, drop the one it does, or restore a peer list that no longer
+        matches the entries. Called after a successful restore to make the two
+        sides agree again."""
+        data = self.load_data()
+        base = self.protocol_base(protocol)
+
+        if base == 'exit':
+            servers = data.get('servers', [])
+            if not isinstance(server_id, int) or server_id < 0 or server_id >= len(servers):
+                return {}
+            uid = servers[server_id].get('uid')
+            entries = await self.relink_entries_for_exit(uid) if uid else []
+            return {'exit_entries_relinked': entries} if entries else {}
+
+        if base not in self.awg_protocols:
+            return {}
+        try:
+            entry, rec = self._entry(data, server_id, protocol)
+        except ExitLinkError:
+            return {}
+
+        if rec.get('exit_link'):
+            try:
+                await self.relink_entry(server_id, protocol)
+                return {'exit_link_restored': 'relinked'}
+            except Exception as err:
+                logger.warning("re-link after restore failed for %s/%s: %s",
+                               entry.get('name'), protocol, err)
+                await self._update_record(
+                    entry['uid'], protocol,
+                    lambda r: (r.get('exit_link') or {}).__setitem__('stale', 'restore_relink_failed'))
+                return {'exit_link_restored': 'stale', 'exit_link_error': str(err)}
+
+        # The panel knows of no link, so a link file coming out of the archive
+        # would silently route clients through an exit nobody is tracking.
+        try:
+            info = await asyncio.to_thread(self._awg(entry).exit_link_info, protocol)
+        except Exception as err:
+            logger.warning("could not read the link state after restore: %s", err)
+            return {}
+        if not info:
+            return {}
+        try:
+            await asyncio.to_thread(self._awg(entry).exit_unlink, protocol)
+            return {'exit_link_restored': 'removed', 'exit_name': info.get('exit_name', '')}
+        except Exception as err:
+            logger.warning("could not remove the restored link file: %s", err)
+            return {'exit_link_restored': 'orphan', 'exit_name': info.get('exit_name', '')}
+
     async def detach_entries_for_exit(self, exit_uid, reason):
         """The exit is gone (uninstalled, deleted, cleared): restore direct
         egress on every linked entry; unreachable ones keep the record marked

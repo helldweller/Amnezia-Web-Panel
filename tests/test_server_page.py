@@ -79,6 +79,13 @@ class ExitNodeUiWiringTests(unittest.TestCase):
         self.assertIn('id="awgSetMtuExitHint"', self.page)
         self.assertIn("_('awg_mtu_exit_hint').replace('{exit_mtu}', data.exit_mtu)", self.page)
 
+    def test_restore_reports_the_exit_link_outcome(self):
+        body = self.page[self.page.index('backups/restore'):][:1600]
+        for key in ('exit_entries_relinked', 'exit_link_restored'):
+            self.assertIn(key, body, f'restore handler ignores {key}')
+        for state in ('relinked', 'stale', 'removed', 'orphan'):
+            self.assertIn(f"_('exit_restore_{state}')", body)
+
     def test_translations_carry_every_ui_key_in_all_languages(self):
         keys = set(re.findall(r"_\('(exit_[a-z0-9_]+)'\)", self.page))
         keys |= set(re.findall(r"\{\{ _\('(exit_[a-z0-9_]+)'\) \}\}", self.page))
