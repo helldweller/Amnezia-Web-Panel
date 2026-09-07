@@ -42,7 +42,10 @@ COPY forward-records.conf /opt/unbound/etc/unbound/forward-records.conf
             self.ssh.run_sudo_command("docker rm amnezia-dns || true")
             
             # Create internal network for DNS (like original Amnezia client)
-            self.ssh.run_sudo_command("docker network ls | grep -q amnezia-dns-net || docker network create --subnet 172.29.172.0/24 amnezia-dns-net")
+            # Both halves need root: `sudo <a> || <b>` would run the create unprivileged
+            self.ssh.run_sudo_command(
+                "sh -c 'docker network ls | grep -q amnezia-dns-net || "
+                "docker network create --subnet 172.29.172.0/24 amnezia-dns-net'")
             
             # Use internal network with static IP. Do not expose 53 on host to avoid systemd-resolved conflict.
             cmd = "docker run -d --name amnezia-dns --restart always --network amnezia-dns-net --ip=172.29.172.254 amnezia-dns"
