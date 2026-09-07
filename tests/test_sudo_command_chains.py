@@ -9,6 +9,7 @@ single `sh -c` (the pattern the rest of BackupManager already uses).
 import unittest
 
 from managers.backup_manager import BackupManager
+from managers.adguard_manager import AdguardManager
 from managers.dns_manager import DNSManager
 
 
@@ -62,6 +63,24 @@ class SudoChainTests(unittest.TestCase):
         network = [c for c in ssh.commands if 'amnezia-dns-net' in c and 'network' in c]
         self.assertTrue(network, ssh.commands)
         self.assertTrue(chain_is_wrapped(network[0]), network[0])
+
+    def test_dns_attaches_existing_containers_in_one_shell(self):
+        ssh = RecordingSSH(code=0)
+        try:
+            DNSManager(ssh).install_protocol()
+        except Exception:
+            pass
+        connects = [c for c in ssh.commands if 'network connect' in c]
+        self.assertTrue(connects, ssh.commands)
+        for cmd in connects:
+            self.assertTrue(chain_is_wrapped(cmd), cmd)
+        # the exit-node container is among the ones attached
+        self.assertTrue(any('amnezia-exit' in c for c in connects))
+
+    def test_adguard_network_creation_runs_the_chain_in_one_shell(self):
+        ssh = RecordingSSH(code=0)
+        AdguardManager(ssh)._ensure_network()
+        self.assertTrue(chain_is_wrapped(ssh.commands[0]), ssh.commands[0])
 
     def test_helper_flags_a_bare_chain(self):
         self.assertFalse(chain_is_wrapped("test -f a && cp a b"))
