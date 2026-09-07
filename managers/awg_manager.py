@@ -1602,12 +1602,12 @@ x_exit_sync() {
             f"docker cp /tmp/_amnz_exit.sh {container_name}:/tmp/_amnz_exit.sh")
         if code != 0:
             self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
-            raise RuntimeError(f"exit link apply failed: {err or out}")
+            raise RuntimeError(f"exit link apply failed: {err or out or f'SSH exit code {code}'}")
         out, err, code = self.ssh.run_sudo_command(
             f"docker exec {container_name} bash /tmp/_amnz_exit.sh", timeout=60)
         self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
         if code != 0:
-            raise RuntimeError(f"exit link apply failed: {out or err}")
+            raise RuntimeError(f"exit link apply failed: {out or err or f'SSH exit code {code}'}")
         return out
 
     def exit_link(self, protocol_type, link):
@@ -1629,7 +1629,7 @@ x_exit_sync() {
             for step in steps:
                 out, err, code = self.ssh.run_sudo_command(step)
                 if code != 0:
-                    raise RuntimeError(f"Failed to write exit0.conf: {err or out}")
+                    raise RuntimeError(f"Failed to write exit0.conf: {err or out or f'SSH exit code {code}'}")
         finally:
             self.ssh.run_command("rm -f /tmp/_amnz_exit0.conf")
         # Resolved path: an older legacy install may keep its config at awg0.conf.
