@@ -1581,6 +1581,23 @@ x_exit_sync() {
         self._write_start_script(protocol_type, config_path=self._resolve_config_path(protocol_type))
         return self._exit_apply(protocol_type)
 
+    def exit_set_dns_via_exit(self, protocol_type, enabled):
+        """Flip the DnsViaExit marker in exit0.conf and re-apply the block.
+        With it on, the exception that keeps client DNS on this node is not
+        installed, so DNS queries follow the client subnet through the link
+        and are answered by the AmneziaDNS of the exit node. Re-applying
+        recreates exit0, so flows opened before the change reopen."""
+        container_name = self._container_name(protocol_type)
+        value = 'on' if enabled else 'off'
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c 'test -f {EXIT_CONF} || exit 9; "
+            f"sed -i \"s|^# DnsViaExit = .*|# DnsViaExit = {value}|\" {EXIT_CONF}'")
+        if code == 9:
+            raise RuntimeError('This instance has no exit link file')
+        if code != 0:
+            raise RuntimeError(f"Failed to update the DNS route of the link: {err or out}")
+        return self._exit_apply(protocol_type)
+
     def exit_unlink(self, protocol_type):
         """Tear the link down live and delete exit0.conf; the key pair stays
         so a re-link reuses the public key already known to the exit."""
@@ -2836,11 +2853,15 @@ AllowedIPs = {allowed_ips}
     def get_awg_settings(self, protocol_type):
         """Client-facing AWG settings currently stored in the server config."""
         params = self._get_awg_params_from_config(protocol_type)
+        link_info = self.exit_link_info(protocol_type)
         settings = {
             'mtu': self._get_mtu(protocol_type),
             'dns': self._get_dns(protocol_type),
             'default_i1': AWG_DEFAULT_I1,
             'supports_special_junk': self._base_protocol(protocol_type) != self.AWG_LEGACY,
+            # an instance behind an exit link cannot carry more than the link
+            'exit_linked': bool(link_info),
+            'exit_mtu': EXIT_MTU,
         }
         for key in SPECIAL_JUNK_KEYS:
             settings[key] = params.get(key, '')

@@ -42,6 +42,7 @@ class FakeAWG:
         self.egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
         self.egress_error = None
         self.endpoint = '203.0.113.5:55520'
+        self.dns_error = None
 
     def exit_prepare_keys(self, protocol):
         self.calls.append(('exit_prepare_keys', protocol))
@@ -71,6 +72,12 @@ class FakeAWG:
         if self.egress_error:
             raise RuntimeError(self.egress_error)
         return dict(self.egress)
+
+    def exit_set_dns_via_exit(self, protocol, enabled):
+        self.calls.append(('exit_set_dns_via_exit', protocol, enabled))
+        if self.dns_error:
+            raise RuntimeError(self.dns_error)
+        return 'exit link up: 10.9.0.7/24 -> table 200'
 
     def exit_unlink(self, protocol):
         self.calls.append(('exit_unlink', protocol))
@@ -350,6 +357,7 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
 
     def test_relink_entry_reuses_the_saved_exit_and_forces(self):
         h = self.linked()
+        h.data['servers'][1]['protocols']['dns'] = {'installed': True}
         h.data['servers'][0]['protocols']['awg2']['exit_link']['dns_via_exit'] = True
         never = {'up': False, 'handshake_age': None, 'rx_bytes': 0, 'tx_bytes': 0, 'endpoint': ''}
         h.awg().status_sequence = [never] * 20
@@ -359,6 +367,16 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
         self.assertTrue(h.record()['exit_link']['dns_via_exit'])
         with self.assertRaises(ExitLinkError):
             run(h.service.relink_entry(0, 'awg_legacy'))
+
+    def test_relink_drops_dns_via_exit_when_the_exit_lost_its_dns(self):
+        # repairing a link must not fail over an option the caller did not ask
+        # for: the saved flag is dropped so DNS comes home instead of nowhere
+        h = self.linked()
+        h.data['servers'][0]['protocols']['awg2']['exit_link']['dns_via_exit'] = True
+        result = run(h.service.relink_entry(0, 'awg2'))
+        self.assertIn('exit_dns_disabled_no_dns', result['warnings'])
+        self.assertFalse(h.awg().calls[1][2]['dns_via_exit'])
+        self.assertFalse(h.record()['exit_link']['dns_via_exit'])
 
     def test_relink_entries_for_exit_reports_per_entry(self):
         h = Harness()
@@ -465,6 +483,57 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
         with self.assertRaises(ExitLinkError) as ctx:
             run(h.service.check_egress(0, 'awg2'))
         self.assertEqual(ctx.exception.code, 'exit_egress_failed')
+    def test_dns_via_exit_needs_amnezia_dns_on_the_exit(self):
+        h = self.linked()
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.set_dns_via_exit(0, 'awg2', True))
+        self.assertEqual(ctx.exception.code, 'exit_dns_needs_dns')
+        self.assertIsNone(h.record().get('exit_link', {}).get('dns_via_exit') or None)
+        # linking with the flag is refused for the same reason
+        h2 = Harness()
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h2.service.link(0, 'awg2', 'exit-a', dns_via_exit=True))
+        self.assertEqual(ctx.exception.code, 'exit_dns_needs_dns')
+
+    def test_dns_via_exit_toggles_and_persists(self):
+        h = self.linked()
+        h.data['servers'][1]['protocols']['dns'] = {'installed': True}
+        result = run(h.service.set_dns_via_exit(0, 'awg2', True))
+        self.assertTrue(result['dns_via_exit'])
+        self.assertEqual(h.awg().calls[-1], ('exit_set_dns_via_exit', 'awg2', True))
+        self.assertTrue(h.record()['exit_link']['dns_via_exit'])
+
+        run(h.service.set_dns_via_exit(0, 'awg2', False))
+        self.assertEqual(h.awg().calls[-1], ('exit_set_dns_via_exit', 'awg2', False))
+        self.assertFalse(h.record()['exit_link']['dns_via_exit'])
+
+    def test_dns_via_exit_survives_a_relink_and_is_reported_by_the_apply_error(self):
+        h = self.linked()
+        h.data['servers'][1]['protocols']['dns'] = {'installed': True}
+        run(h.service.set_dns_via_exit(0, 'awg2', True))
+        run(h.service.relink_entry(0, 'awg2'))
+        self.assertTrue(h.awg().calls[-2][2]['dns_via_exit'] if h.awg().calls[-2][0] == 'exit_link'
+                        else h.record()['exit_link']['dns_via_exit'])
+        self.assertTrue(h.record()['exit_link']['dns_via_exit'])
+
+        h.awg().dns_error = 'container is gone'
+        with self.assertRaises(ExitLinkError) as ctx:
+            run(h.service.set_dns_via_exit(0, 'awg2', False))
+        self.assertEqual(ctx.exception.code, 'exit_apply_failed')
+        # the record still says what the container actually has
+        self.assertTrue(h.record()['exit_link']['dns_via_exit'])
+
+    def test_removing_dns_from_the_exit_brings_entry_dns_back(self):
+        h = self.linked()
+        h.data['servers'][1]['protocols']['dns'] = {'installed': True}
+        run(h.service.set_dns_via_exit(0, 'awg2', True))
+        del h.data['servers'][1]['protocols']['dns']
+
+        restored = run(h.service.disable_dns_via_exit_for_exit('exit-a'))
+        self.assertEqual([(r['protocol'], r['status']) for r in restored], [('awg2', 'success')])
+        self.assertFalse(h.record()['exit_link']['dns_via_exit'])
+        # nothing to do the second time
+        self.assertEqual(run(h.service.disable_dns_via_exit_for_exit('exit-a')), [])
 
     def test_peer_id_format(self):
         self.assertEqual(peer_id_for('abc', 'awg2'), 'abc:awg2')

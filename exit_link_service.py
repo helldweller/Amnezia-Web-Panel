@@ -158,6 +158,57 @@ class ExitLinkService:
             except Exception as err:  # the original error is what the user must see
                 logger.warning("exit link rollback: %s failed: %s", what, err)
 
+    @staticmethod
+    def _require_exit_dns(exit_srv):
+        """DNS via the exit only works when that node runs AmneziaDNS: the
+        clients keep resolving 172.29.172.254, which is answered on whichever
+        node the query comes out of."""
+        dns_rec = (exit_srv.get('protocols') or {}).get('dns') or {}
+        if not dns_rec.get('installed'):
+            raise ExitLinkError('exit_dns_needs_dns',
+                                'Install AmneziaDNS on the exit node before routing client DNS through it')
+
+    async def set_dns_via_exit(self, entry_server_id, protocol, enabled):
+        """Turn client DNS resolution at the exit node on or off for a linked
+        instance. Off (the default) keeps DNS on the entry node."""
+        data = self.load_data()
+        entry, rec = self._entry(data, entry_server_id, protocol)
+        link = rec.get('exit_link')
+        if not link:
+            raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
+        enabled = bool(enabled)
+        if enabled:
+            exit_srv, _ = self._exit(data, link.get('exit_uid'))
+            self._require_exit_dns(exit_srv)
+        async with self._locks[(entry['uid'], protocol)]:
+            awg = self._awg(entry)
+            try:
+                log = await asyncio.to_thread(awg.exit_set_dns_via_exit, protocol, enabled)
+            except Exception as err:
+                raise ExitLinkError('exit_apply_failed', str(err))
+            await self._update_record(
+                entry['uid'], protocol,
+                lambda r: (r.get('exit_link') or {}).__setitem__('dns_via_exit', enabled))
+        return {'status': 'success', 'dns_via_exit': enabled, 'log': [log]}
+
+    async def disable_dns_via_exit_for_exit(self, exit_uid):
+        """AmneziaDNS is gone from an exit node: bring the DNS of every entry
+        linked to it back home instead of leaving queries in a black hole."""
+        results = []
+        data = self.load_data()
+        for item in self.linked_entries(data, exit_uid):
+            _, rec = self._entry(data, item['server_id'], item['protocol'])
+            if not (rec.get('exit_link') or {}).get('dns_via_exit'):
+                continue
+            try:
+                await self.set_dns_via_exit(item['server_id'], item['protocol'], False)
+                results.append({**item, 'status': 'success'})
+            except Exception as err:
+                logger.warning("could not bring DNS back to entry %s/%s: %s",
+                               item['server_id'], item['protocol'], err)
+                results.append({**item, 'status': 'error', 'error': str(err)})
+        return results
+
     async def link(self, entry_server_id, protocol, exit_uid, force=False, dns_via_exit=None):
         data = self.load_data()
         entry, rec = self._entry(data, entry_server_id, protocol)
@@ -168,10 +219,21 @@ class ExitLinkService:
             raise ExitLinkError('exit_legacy_obfuscation',
                                 'AmneziaWG Legacy can only link to a non-obfuscated exit node')
         previous = rec.get('exit_link') or {}
-        if dns_via_exit is None:
-            dns_via_exit = bool(previous.get('dns_via_exit'))
+        explicit_dns = dns_via_exit is not None
+        dns_via_exit = bool(previous.get('dns_via_exit') if dns_via_exit is None else dns_via_exit)
         peer_id = peer_id_for(entry['uid'], protocol)
         warnings, log = [], []
+        if dns_via_exit:
+            try:
+                self._require_exit_dns(exit_srv)
+            except ExitLinkError:
+                # Repairing a link must not fail over an option the caller did
+                # not ask for; the flag inherited from the saved link is dropped
+                # so DNS comes back to this node instead of a black hole.
+                if explicit_dns:
+                    raise
+                dns_via_exit = False
+                warnings.append('exit_dns_disabled_no_dns')
 
         async with self._locks[(entry['uid'], protocol)]:
             awg = self._awg(entry)
@@ -283,8 +345,7 @@ class ExitLinkService:
         link = rec.get('exit_link')
         if not link:
             raise ExitLinkError('not_linked', 'This instance is not linked to an exit node')
-        return await self.link(entry_server_id, protocol, link['exit_uid'], force=True,
-                               dns_via_exit=bool(link.get('dns_via_exit')))
+        return await self.link(entry_server_id, protocol, link['exit_uid'], force=True)
 
     async def relink_entries_for_exit(self, exit_uid):
         """After an exit node was reinstalled: re-register every linked entry."""
