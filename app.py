@@ -3735,6 +3735,21 @@ async def api_exit_link_status(request: Request, server_id: int, req: ProtocolRe
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/exit-link/check-egress', tags=["Protocols"])
+async def api_exit_link_check_egress(request: Request, server_id: int, req: ProtocolRequest):
+    """Public IP the clients of this instance leave from, compared with the
+    exit node address (two HTTP probes from inside the container)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.check_egress(server_id, req.protocol)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error checking exit egress")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/awg/settings', tags=["Protocols"])
 async def api_awg_settings_get(request: Request, server_id: int, req: ProtocolRequest):
     """Return MTU, DNS and the special junk packets I1-I5 of an AWG server."""

@@ -58,6 +58,17 @@ class ExitNodeUiWiringTests(unittest.TestCase):
         self.assertIn("document.body.dataset.serverUid = {{ (server.uid or '') | tojson }};", self.page)
         self.assertIn("{ protocol: proto, force: true }", self.page)
 
+    def test_egress_check_is_wired_to_a_linked_instance_only(self):
+        self.assertIn('id="exitEgressBtn"', self.page)
+        self.assertIn('id="exitLinkEgress"', self.page)
+        self.assertRegex(self.page, r"function checkExitEgress\(")
+        self.assertIn("exit-link/check-egress", self.page)
+        # the button appears only when the instance actually has a link
+        self.assertIn("document.getElementById('exitEgressBtn').classList.toggle('hidden', !link);", self.page)
+        # the probed address comes from the server, so it is escaped
+        body = self.page[self.page.index('function checkExitEgress'):self.page.index('async function repairExitLink')]
+        self.assertNotRegex(body, r'\$\{r\.[a-z_]+( \|\| [^}]*)?\}')
+
     def test_translations_carry_every_ui_key_in_all_languages(self):
         keys = set(re.findall(r"_\('(exit_[a-z0-9_]+)'\)", self.page))
         keys |= set(re.findall(r"\{\{ _\('(exit_[a-z0-9_]+)'\) \}\}", self.page))
