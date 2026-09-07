@@ -199,8 +199,16 @@ cat > {self.CONFIG_PATH} <<EOF
             results.append("Docker already installed")
 
         results.append("Preparing host...")
-        self.prepare_host(self.PROTOCOL)
+        docker_ipv6 = self.prepare_host(self.PROTOCOL)
         results.append("Host prepared")
+        if docker_ipv6 == 'pending':
+            results.append(
+                "! Docker IPv6 was enabled in /etc/docker/daemon.json, but Docker "
+                "was NOT restarted because other containers are running. The transit "
+                "stays IPv4-only until you run: systemctl restart docker"
+            )
+        elif docker_ipv6 == 'restarted':
+            results.append("Docker restarted to apply IPv6 config")
 
         if self.check_protocol_installed(self.PROTOCOL):
             results.append("Removing old container...")

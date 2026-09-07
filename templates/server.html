@@ -2423,11 +2423,20 @@
     async function restoreProtocolBackup(proto, filename) {
         if (!confirm(_('restore_confirm_protocol'))) return;
         try {
-            await apiCall(`/api/servers/${SERVER_ID}/backups/restore`, 'POST', {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/backups/restore`, 'POST', {
                 protocol: proto,
                 filename: filename
             });
             showToast(_('restore_success'), 'success');
+            // an archive can carry a different exit-link state than the panel has
+            const relinked = (res.exit_entries_relinked || []).filter(e => e.status === 'success').length;
+            const failed = (res.exit_entries_relinked || []).filter(e => e.status !== 'success').length;
+            if (relinked) showToast(_('exit_restore_entries_relinked').replace('{n}', relinked), 'info');
+            if (failed) showToast(_('exit_restore_entries_failed').replace('{n}', failed), 'error');
+            if (res.exit_link_restored === 'relinked') showToast(_('exit_restore_relinked'), 'info');
+            if (res.exit_link_restored === 'stale') showToast(_('exit_restore_stale'), 'error');
+            if (res.exit_link_restored === 'removed') showToast(_('exit_restore_removed'), 'info');
+            if (res.exit_link_restored === 'orphan') showToast(_('exit_restore_orphan'), 'error');
             await loadProtocolBackups();
             if (typeof loadConnections === 'function') {
                 await loadConnections();

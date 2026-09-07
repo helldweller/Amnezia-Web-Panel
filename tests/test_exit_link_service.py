@@ -42,6 +42,8 @@ class FakeAWG:
         self.egress = {'via_exit': '203.0.113.5', 'direct': '198.51.100.1'}
         self.egress_error = None
         self.endpoint = '203.0.113.5:55520'
+        self.link_info = None          # what exit0.conf inside the container says
+        self.link_info_error = None
         self.dns_error = None
 
     def exit_prepare_keys(self, protocol):
@@ -66,6 +68,12 @@ class FakeAWG:
         if self.status_sequence:
             return self.status_sequence.pop(0)
         return {'up': True, 'handshake_age': 3, 'rx_bytes': 1, 'tx_bytes': 2, 'endpoint': self.endpoint}
+
+    def exit_link_info(self, protocol):
+        self.calls.append(('exit_link_info', protocol))
+        if self.link_info_error:
+            raise RuntimeError(self.link_info_error)
+        return self.link_info
 
     def exit_check_egress(self, protocol):
         self.calls.append(('exit_check_egress', protocol))
@@ -534,6 +542,46 @@ class UnlinkAndLifecycleTests(unittest.TestCase):
         self.assertFalse(h.record()['exit_link']['dns_via_exit'])
         # nothing to do the second time
         self.assertEqual(run(h.service.disable_dns_via_exit_for_exit('exit-a')), [])
+
+    def test_restore_of_a_linked_entry_re_establishes_the_link(self):
+        h = self.linked()
+        result = run(h.service.reconcile_after_restore(0, 'awg2'))
+        self.assertEqual(result, {'exit_link_restored': 'relinked'})
+        self.assertIn('exit_link', [c[0] for c in h.awg().calls])
+        self.assertIsNone(h.record()['exit_link']['stale'])
+
+    def test_restore_marks_the_link_stale_when_it_cannot_be_re_established(self):
+        h = self.linked()
+        h.awg().link_error = 'container is gone'
+        result = run(h.service.reconcile_after_restore(0, 'awg2'))
+        self.assertEqual(result['exit_link_restored'], 'stale')
+        self.assertEqual(h.record()['exit_link']['stale'], 'restore_relink_failed')
+
+    def test_restore_drops_a_link_the_panel_does_not_track(self):
+        # the archive predates the unlink: the container comes back linked
+        h = Harness()
+        h.awg().link_info = {'exit_uid': 'exit-a', 'exit_name': 'Berlin-1', 'obfuscation': False,
+                             'dns_via_exit': False, 'address': '10.9.0.7/24', 'endpoint': '203.0.113.5:55520'}
+        result = run(h.service.reconcile_after_restore(0, 'awg2'))
+        self.assertEqual(result, {'exit_link_restored': 'removed', 'exit_name': 'Berlin-1'})
+        self.assertIn(('exit_unlink', 'awg2'), h.awg().calls)
+
+    def test_restore_of_an_unlinked_entry_without_a_link_file_does_nothing(self):
+        h = Harness()
+        self.assertEqual(run(h.service.reconcile_after_restore(0, 'awg2')), {})
+        self.assertNotIn('exit_unlink', [c[0] for c in h.awg().calls])
+
+    def test_restore_of_an_exit_node_re_registers_its_entries(self):
+        h = self.linked()
+        result = run(h.service.reconcile_after_restore(1, 'exit'))
+        self.assertEqual([(e['protocol'], e['status']) for e in result['exit_entries_relinked']],
+                         [('awg2', 'success')])
+        # nothing to do when no entry points at this exit
+        self.assertEqual(run(h.service.reconcile_after_restore(2, 'exit')), {})
+
+    def test_restore_of_an_unrelated_protocol_is_ignored(self):
+        h = self.linked()
+        self.assertEqual(run(h.service.reconcile_after_restore(0, 'xray')), {})
 
     def test_peer_id_format(self):
         self.assertEqual(peer_id_for('abc', 'awg2'), 'abc:awg2')
