@@ -159,6 +159,7 @@ not, and it is easy to forget `DATA_FILE`.
 | Symptom | Cause and fix |
 |---|---|
 | `port 5000 is taken by something else` | Another panel or an old run. `$PY $DRV down`, or `$PY $DRV up --port 5001`. |
+| `stale pid file removed - that process is not our panel` | The pid file outlived its panel (a crash, or the run dir was recreated). `down` refuses to signal a pid it cannot confirm, so nothing was killed; just `up` again. |
 | `panel died on startup, log above` | Deps missing or `DATA_FILE` unwritable. Re-run `python3 $DRV venv`, check `$PY $DRV logs`. |
 | `AttributeError: module 'urllib.request' has no attribute 'open'` | Stale driver copy - `urlopen` is the correct call; re-pull this file. |
 | `chrome did not expose its debugging port` | `google-chrome` missing or sandboxed. Install it, or set `AWP_CHROME`. |

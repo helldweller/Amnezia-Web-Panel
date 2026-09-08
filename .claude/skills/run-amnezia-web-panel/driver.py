@@ -13,7 +13,7 @@ Usage:
     driver.py shot out.png [/path] [--full] [--wait SEC] [--js "expr"]
                                    screenshot a page, logging in through the UI;
                                    --js runs before the shot (open a modal, etc)
-    driver.py eval "js"            run JS in a logged-in page, print the result
+    driver.py eval "js" [/path]    run JS in a logged-in page, print the result
     driver.py logs [N]             tail the panel log
     driver.py down                 stop the panel
     driver.py smoke                up + seed + api + shot + down, exit 1 on failure
@@ -123,15 +123,34 @@ def cmd_up(argv):
     return 0
 
 
+def _panel_pid():
+    """The pid from the pid file, but only while it still looks like our panel.
+    Pids get reused, and this file outlives crashes - SIGTERM to a whole process
+    group is not something to aim at a guess."""
+    pid_file = paths()['pid']
+    if not os.path.exists(pid_file):
+        return None
+    try:
+        pid = int(open(pid_file).read().strip())
+        cmdline = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\0', b' ')
+    except (ValueError, OSError):
+        return None
+    return pid if b'app.py' in cmdline else None
+
+
 def cmd_down(argv):
     p = paths()
-    if not os.path.exists(p['pid']):
-        print('not running')
+    pid = _panel_pid()
+    if pid is None:
+        if os.path.exists(p['pid']):
+            os.remove(p['pid'])
+            print('stale pid file removed - that process is not our panel')
+        else:
+            print('not running')
         return 0
-    pid = int(open(p['pid']).read().strip())
     try:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     for _ in range(40):
         if not _port_open(PORT):
@@ -192,7 +211,12 @@ def cmd_api(argv):
     if len(argv) < 2:
         sys.exit('usage: driver.py api METHOD PATH [JSON_BODY]')
     method, path = argv[0].upper(), argv[1]
-    body = json.loads(argv[2]) if len(argv) > 2 else None
+    if not path.startswith('/'):
+        sys.exit(f'path must start with a slash: {path!r}')
+    try:
+        body = json.loads(argv[2]) if len(argv) > 2 else None
+    except ValueError as exc:
+        sys.exit(f'body is not valid JSON: {exc}')
     tok = _ensure_token()
     status, text = _request(method, base_url() + path, body,
                             headers={'Authorization': f'Bearer {tok}'})
@@ -210,7 +234,12 @@ def cmd_seed(argv):
     run-dir data.json - load_data() re-reads the file on every request."""
     import uuid
     p = paths()['data']
-    d = json.load(open(p))
+    if not os.path.exists(p):
+        sys.exit(f'{p} does not exist - run `driver.py up` first')
+    try:
+        d = json.load(open(p))
+    except ValueError as exc:
+        sys.exit(f'{p} is not valid JSON ({exc}) - delete it and run `up` again')
     if any(s.get('name') == 'demo-entry' for s in d.get('servers', [])):
         print('already seeded')
         return 0
@@ -394,7 +423,8 @@ def cmd_smoke(argv):
     cmd_up([])
     try:
         cmd_seed([])
-        assert cmd_api(['GET', '/api/exit-nodes']) == 0, 'exit-nodes call failed'
+        if cmd_api(['GET', '/api/exit-nodes']) != 0:
+            sys.exit('exit-nodes call failed')
         out = os.path.join(RUN_DIR, 'dashboard.png')
         cmd_shot([out])
         title = asyncio.run(_with_ui('/', lambda c: c.js('document.title')))
