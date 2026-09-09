@@ -113,13 +113,24 @@ async def custom_redoc():
     return get_redoc_html(
         openapi_url=app.openapi_url or "/openapi.json",
         title=f"{app.title} — ReDoc",
-        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+        redoc_js_url="/static/vendor/redoc/redoc.standalone.js",
         with_google_fonts=False,
     )
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
 # Mount static files & templates
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+class CachedStaticFiles(StaticFiles):
+    """Static assets are fingerprinted with ?v=<static mtime> (see
+    static_version()), so a redeploy changes the URL and busts the cache.
+    That lets us hand the browser a long 180-day cache lifetime."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers['Cache-Control'] = 'public, max-age=15552000, immutable'
+        return response
+
+app.mount("/static", CachedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 if getattr(sys, 'frozen', False):
@@ -2192,8 +2203,10 @@ class ToggleConnectionRequest(BaseModel):
 
 class AddUserRequest(BaseModel):
     username: str
-    password: str
-    role: str = 'user'
+    # Password is optional: role 'none' (the default) is a record-only user
+    # who cannot log in, so no password is needed. Any real role requires one.
+    password: Optional[str] = None
+    role: str = 'none'
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -2284,6 +2297,7 @@ class SelfServiceConnectionRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -2760,7 +2774,7 @@ async def index(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
-    if user['role'] == 'user':
+    if user['role'] not in ('admin', 'support'):
         return RedirectResponse(url='/my', status_code=302)
     data = load_data()
     return tpl(request, 'index.html', servers=data['servers'])
@@ -2847,8 +2861,13 @@ async def api_login(request: Request, req: LoginRequest):
         request.session.pop('captcha_answer', None)
 
     for u in data.get('users', []):
-        if u['username'] == req.username and verify_password(req.password, u['password_hash']):
+        # Users without a password (role 'none', record-only) can never log in.
+        if u['username'] == req.username and u.get('password_hash') and verify_password(req.password, u['password_hash']):
             lang = request.cookies.get('lang', 'ru')
+            if u.get('role') == 'none':
+                # Record-only account: even a password set later does not
+                # grant access until a real role is assigned.
+                return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
             if not u.get('enabled', True):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
             request.session['user_id'] = u['id']
@@ -4334,6 +4353,31 @@ async def api_host_tuning(request: Request, server_id: int):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/protocol/rename', tags=["Protocols"])
+async def api_rename_protocol(request: Request, server_id: int, req: RenameProtocolRequest):
+    """Set or clear a custom display name for an installed protocol instance."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        protocols = server.get('protocols') or {}
+        if req.protocol not in protocols:
+            return JSONResponse({'error': 'Protocol is not installed on this server'}, status_code=404)
+        name = req.name.strip()[:64]
+        if name:
+            protocols[req.protocol]['custom_name'] = name
+        else:
+            protocols[req.protocol].pop('custom_name', None)
+        save_data(data)
+        return {'status': 'success', 'custom_name': name}
+    except Exception as e:
+        logger.exception("Error renaming protocol instance")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/wgeasy/preview', tags=["Protocols"])
 async def api_wgeasy_preview(request: Request, server_id: int, req: WgEasyPreviewRequest):
     """Fetch the client list from a wg-easy / amnezia-wg-easy panel running on
@@ -4810,7 +4854,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         # Users can only view their own connections
-        if user['role'] == 'user':
+        if user['role'] in ('user', 'none'):
             owned = any(
                 c for c in data.get('user_connections', [])
                 if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
@@ -4928,12 +4972,14 @@ async def api_add_user(request: Request, req: AddUserRequest):
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
-        if req.role not in ('admin', 'support', 'user'):
+        if req.role not in ('admin', 'support', 'user', 'none'):
             return JSONResponse({'error': 'Invalid role'}, status_code=400)
+        if req.role != 'none' and not req.password:
+            return JSONResponse({'error': _t('password_required_for_role', lang)}, status_code=400)
         new_user = {
             'id': str(uuid.uuid4()),
             'username': req.username,
-            'password_hash': hash_password(req.password),
+            'password_hash': hash_password(req.password) if req.password else None,
             'role': req.role,
             'telegramId': telegram_id,
             'email': req.email,
@@ -5013,6 +5059,14 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({'error': 'User not found'}, status_code=404)
             
+        if req.username is not None:
+            new_name = req.username.strip()
+            if not new_name:
+                return JSONResponse({'error': 'Username must not be empty'}, status_code=400)
+            if any(u['username'] == new_name and u['id'] != user_id for u in data.get('users', [])):
+                lang = request.cookies.get('lang', 'ru')
+                return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
+            user['username'] = new_name
         if req.telegramId is not None:
             try:
                 user['telegramId'] = _normalize_telegram_id(req.telegramId)
@@ -5180,7 +5234,7 @@ async def api_get_user_connections(request: Request, user_id: str):
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # Users can only see their own, admin/support can see all
-    if user['role'] == 'user' and user['id'] != user_id:
+    if user['role'] in ('user', 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
