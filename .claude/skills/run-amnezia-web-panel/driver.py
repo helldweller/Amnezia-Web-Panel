@@ -147,8 +147,11 @@ def cmd_up(argv):
     p = paths()
     os.makedirs(RUN_DIR, exist_ok=True)
 
-    if os.path.exists(p['pid']) and _port_open(PORT):
-        print(f'already running on {base_url()}')
+    running = _panel_pid()
+    if running is None and os.path.exists(p['pid']):
+        os.remove(p['pid'])          # crashed panel, or a pid that got reused
+    if running is not None and _port_open(PORT):
+        print(f'already running on {base_url()} (pid {running})')
         # Mint a fresh token rather than assuming the cached one survived: the
         # run dir may have been cleaned while the panel kept running.
         print(f'token: {_ensure_token()}')
