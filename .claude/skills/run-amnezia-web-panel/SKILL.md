@@ -49,6 +49,8 @@ Piece by piece:
 
 ```bash
 $PY $DRV up              # start on :5000, print URL + bearer token (--port to move it)
+                         #   --port writes settings.ssl.panel_port into the run
+                         #   dir's data.json - app.py has no port flag of its own
 $PY $DRV seed            # add a fake server so the UI is not an empty list
 $PY $DRV api GET /api/exit-nodes
 $PY $DRV api POST /api/settings/tokens '{"name":"scratch"}'

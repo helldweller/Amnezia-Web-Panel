@@ -49,12 +49,27 @@ def paths():
         'log': os.path.join(RUN_DIR, 'panel.log'),
         'pid': os.path.join(RUN_DIR, 'panel.pid'),
         'token': os.path.join(RUN_DIR, 'token'),
+        'port': os.path.join(RUN_DIR, 'port'),
         'chrome_profile': os.path.join(RUN_DIR, 'chrome'),
     }
 
 
 def base_url():
     return f'http://127.0.0.1:{PORT}'
+
+
+def _load_port():
+    """Adopt the port `up` recorded, so api/shot/eval/logs find the panel.
+
+    Without this every other command would talk to 5000 while the panel is on
+    whatever --port asked for.
+    """
+    global PORT
+    if 'AWP_PORT' in os.environ:
+        return
+    recorded = paths()['port']
+    if os.path.exists(recorded):
+        PORT = int(open(recorded).read().strip())
 
 
 # ----------------------------------------------------------------- lifecycle
@@ -80,6 +95,27 @@ def _port_open(port, host='127.0.0.1'):
         return s.connect_ex((host, port)) == 0
 
 
+def _write_panel_port(data_file, port):
+    """app.py reads its listen port from settings.ssl.panel_port in data.json.
+
+    There is no flag and no environment variable for it, so --port has to land
+    in the file before the panel starts - otherwise it silently keeps 5000 and
+    a second instance dies with "address already in use".
+    """
+    data = {}
+    if os.path.exists(data_file):
+        with open(data_file, encoding='utf-8') as fh:
+            data = json.load(fh)
+    ssl_conf = data.setdefault('settings', {}).setdefault('ssl', {})
+    if ssl_conf.get('panel_port') == port:
+        return
+    ssl_conf['panel_port'] = port
+    tmp = data_file + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, data_file)
+
+
 def cmd_up(argv):
     global PORT
     if '--port' in argv:
@@ -99,6 +135,8 @@ def cmd_up(argv):
                  f"| grep -oP 'pid=\\K[0-9]+'\n"
                  f'or start elsewhere with --port')
 
+    _write_panel_port(p['data'], PORT)
+    open(p['port'], 'w').write(str(PORT))
     env = dict(os.environ, DATA_FILE=p['data'], TUNNEL_STATE_FILE=p['tunnels'])
     log = open(p['log'], 'w')
     proc = subprocess.Popen([sys.executable, 'app.py'], cwd=REPO, env=env,
@@ -443,4 +481,6 @@ COMMANDS = {'venv': cmd_venv, 'up': cmd_up, 'down': cmd_down, 'api': cmd_api, 's
 if __name__ == '__main__':
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         sys.exit(__doc__)
+    if sys.argv[1] != 'up':
+        _load_port()
     sys.exit(COMMANDS[sys.argv[1]](sys.argv[2:]))
