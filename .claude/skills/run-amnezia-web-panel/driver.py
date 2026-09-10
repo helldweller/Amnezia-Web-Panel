@@ -114,6 +114,17 @@ def _require_panel():
         sys.exit(f'no panel on {base_url()} - start one with: driver.py up')
 
 
+def _write_json(path, data):
+    """Replace a JSON file in one step - the panel re-reads it on every request
+    and holds no read lock, so a half-written file surfaces as a 500."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 def _write_panel_port(data_file, port):
     """app.py reads its listen port from settings.ssl.panel_port in data.json.
 
@@ -129,10 +140,7 @@ def _write_panel_port(data_file, port):
     if ssl_conf.get('panel_port') == port:
         return
     ssl_conf['panel_port'] = port
-    tmp = data_file + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, data_file)
+    _write_json(data_file, data)
 
 
 def cmd_up(argv):
@@ -221,9 +229,12 @@ def cmd_down(argv):
     except (ProcessLookupError, PermissionError):
         pass
     for _ in range(40):
-        if not _port_open(PORT):
+        if _panel_pid() is None and not _port_open(PORT):
             break
         time.sleep(0.25)
+    else:
+        sys.exit(f'panel {pid} did not stop within 10s - still listening on '
+                 f'{base_url()}; kill it by hand before starting another')
     os.remove(p['pid'])
     print('stopped')
     return 0
@@ -324,7 +335,7 @@ def cmd_seed(argv):
                                'subnet': '10.8.1.0/24', 'base_protocol': 'awg2',
                                'instance': 2, 'container_name': 'amnezia-awg2'}},
     })
-    json.dump(d, open(p, 'w'), indent=2)
+    _write_json(p, d)      # tmp + replace: the panel reads this file unlocked
     print(f'seeded demo-entry ({len(d["servers"])} server(s))')
     return 0
 
