@@ -23,6 +23,7 @@ google-chrome for the screenshot commands.
 """
 import asyncio
 import base64
+import collections
 import http.cookiejar
 import json
 import os
@@ -95,6 +96,24 @@ def _port_open(port, host='127.0.0.1'):
         return s.connect_ex((host, port)) == 0
 
 
+def _flag(argv, name, cast=str):
+    """Pop `--name VALUE` out of argv; a flag without a value is a usage error."""
+    if name not in argv:
+        return None
+    i = argv.index(name)
+    if i + 1 >= len(argv):
+        sys.exit(f'{name} needs a value')
+    value = argv[i + 1]
+    del argv[i:i + 2]
+    return cast(value)
+
+
+def _require_panel():
+    """Fail with one line instead of a URLError traceback when nothing listens."""
+    if not _port_open(PORT):
+        sys.exit(f'no panel on {base_url()} - start one with: driver.py up')
+
+
 def _write_panel_port(data_file, port):
     """app.py reads its listen port from settings.ssl.panel_port in data.json.
 
@@ -118,14 +137,21 @@ def _write_panel_port(data_file, port):
 
 def cmd_up(argv):
     global PORT
-    if '--port' in argv:
-        PORT = int(argv[argv.index('--port') + 1])
+    port = _flag(argv, '--port', int)
+    if port is not None:
+        PORT = port
+    else:
+        # A second `up` on the same run dir has to find the panel `up` already
+        # started, not launch a rival on the default port.
+        _load_port()
     p = paths()
     os.makedirs(RUN_DIR, exist_ok=True)
 
     if os.path.exists(p['pid']) and _port_open(PORT):
         print(f'already running on {base_url()}')
-        print(f'token: {open(p["token"]).read().strip()}')
+        # Mint a fresh token rather than assuming the cached one survived: the
+        # run dir may have been cleaned while the panel kept running.
+        print(f'token: {_ensure_token()}')
         return 0
     if _port_open(PORT):
         # Deleting the run dir orphans a running panel: the pid file goes with
@@ -142,6 +168,7 @@ def cmd_up(argv):
     proc = subprocess.Popen([sys.executable, 'app.py'], cwd=REPO, env=env,
                             stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
+    log.close()
     open(p['pid'], 'w').write(str(proc.pid))
 
     for _ in range(120):
@@ -201,7 +228,9 @@ def cmd_down(argv):
 
 def cmd_logs(argv):
     n = int(argv[0]) if argv else 40
-    print(''.join(open(paths()['log']).readlines()[-n:]), end='')
+    with open(paths()['log']) as handle:
+        tail = collections.deque(handle, maxlen=n)   # keeps n lines, not the file
+    print(''.join(tail), end='')
     return 0
 
 
@@ -223,6 +252,7 @@ def _request(method, url, body=None, headers=None, opener=None):
 
 def _ensure_token():
     """Log in with the session cookie once, mint a bearer token, cache it."""
+    _require_panel()
     p = paths()
     if os.path.exists(p['token']):
         tok = open(p['token']).read().strip()
@@ -329,6 +359,7 @@ class CDP:
                 time.sleep(0.25)
         else:
             proc.kill()
+            proc.wait()
             raise RuntimeError('chrome did not expose its debugging port')
         ws = await websockets.connect(ws_url, max_size=64 * 1024 * 1024)
         return proc, CDP(ws)
@@ -403,6 +434,7 @@ class CDP:
 
 
 async def _with_ui(path, action, settle=1.5, js=None):
+    _require_panel()          # cheaper than watching Chrome time out on a dead port
     p = paths()
     proc, cdp = await CDP.launch(p['chrome_profile'])
     try:
@@ -423,19 +455,19 @@ async def _with_ui(path, action, settle=1.5, js=None):
     finally:
         await cdp.ws.close()
         proc.terminate()
+        try:
+            proc.wait(timeout=10)     # otherwise every shot leaves a zombie
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def cmd_shot(argv):
     full = '--full' in argv
-    settle, js = 1.5, None
-    if '--js' in argv:
-        i = argv.index('--js')
-        js = argv[i + 1]
-        del argv[i:i + 2]
-    if '--wait' in argv:
-        i = argv.index('--wait')
-        settle = float(argv[i + 1])
-        del argv[i:i + 2]
+    js = _flag(argv, '--js')
+    settle = _flag(argv, '--wait', float)
+    if settle is None:
+        settle = 1.5
     argv = [a for a in argv if a != '--full']
     out = os.path.abspath(argv[0]) if argv else os.path.join(RUN_DIR, 'shot.png')
     path = argv[1] if len(argv) > 1 else '/'
