@@ -282,10 +282,18 @@ def _ensure_token():
         sys.exit(f'login failed ({status}): {text}')
     status, text = _request('POST', f'{base_url()}/api/settings/tokens',
                             {'name': 'driver'}, opener=opener)
-    tok = json.loads(text).get('token')
+    try:
+        tok = json.loads(text).get('token')
+    except ValueError:
+        # a proxy error page, or the panel dying mid-request
+        sys.exit(f'token endpoint answered {status} with non-JSON: {text[:200]}')
     if not tok:
         sys.exit(f'could not mint a token ({status}): {text}')
-    open(p['token'], 'w').write(tok)
+    # 0600: the run dir is under /tmp, and this token is full admin API access
+    fd = os.open(p['token'], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        fh.write(tok)
+    os.chmod(p['token'], 0o600)
     return tok
 
 
