@@ -58,6 +58,7 @@ class WireGuardManager:
     CONFIG_PATH = '/opt/amnezia/wireguard/wg0.conf'
     KEY_DIR = '/opt/amnezia/wireguard'
     CLIENTS_TABLE_PATH = '/opt/amnezia/wireguard/clientsTable'
+    BWLIMITS_PATH = '/opt/amnezia/wireguard/bwlimits'
     INTERFACE = 'wg0'
 
     def __init__(self, ssh_manager):
@@ -176,7 +177,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"\n"
             f'LABEL maintainer="AmneziaVPN"\n'
             f"\n"
-            f"RUN apk add --no-cache curl wireguard-tools dumb-init iptables bash\n"
+            f"RUN apk add --no-cache curl wireguard-tools dumb-init iptables bash iproute2\n"
             f"RUN apk --update upgrade --no-cache\n"
             f"\n"
             f"RUN mkdir -p /opt/amnezia\n"
@@ -296,10 +297,10 @@ EOF
         if code != 0:
             raise RuntimeError(f"Failed to configure container: {err}")
 
-    def _upload_start_script(self, port):
+    def _upload_start_script(self, port, subnet_ip=None, subnet_cidr=None):
         """Upload and execute the start script inside the container."""
-        subnet_ip = WG_DEFAULTS['subnet_ip']
-        subnet_cidr = WG_DEFAULTS['subnet_cidr']
+        subnet_ip = subnet_ip or WG_DEFAULTS['subnet_ip']
+        subnet_cidr = subnet_cidr or WG_DEFAULTS['subnet_cidr']
 
         start_script = f"""#!/bin/bash
 echo "WireGuard container startup"
@@ -322,6 +323,29 @@ iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth0 -j MASQUERADE
 iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth1 -j MASQUERADE
+
+# Re-apply per-peer bandwidth limits (flat file written by the panel)
+if [ -f {self.BWLIMITS_PATH} ]; then
+    command -v tc >/dev/null 2>&1 || apk add --no-cache iproute2 >/dev/null 2>&1
+    BW={self.BWLIMITS_PATH}
+    IFACE={self.INTERFACE}
+    tc qdisc del dev $IFACE root 2>/dev/null
+    tc qdisc del dev $IFACE ingress 2>/dev/null
+    tc qdisc add dev $IFACE root handle 1: htb default 0 2>/dev/null
+    tc qdisc add dev $IFACE handle ffff: ingress 2>/dev/null
+    i=0
+    while read -r ip4 ip6 mbps; do
+      [ -z "$ip4" ] && continue
+      [ -z "$mbps" ] && continue
+      kbit=$(echo "$mbps" | awk '{{printf "%d", $1*1000}}')
+      [ "$kbit" -gt 0 ] 2>/dev/null || continue
+      i=$((i+1))
+      cid=$((100+i))
+      tc class add dev $IFACE parent 1: classid 1:$cid htb rate ${{kbit}}kbit ceil ${{kbit}}kbit 2>/dev/null
+      tc filter add dev $IFACE parent 1: protocol ip u32 match ip dst $ip4/32 flowid 1:$cid 2>/dev/null
+      tc filter add dev $IFACE parent ffff: protocol ip u32 match ip src $ip4/32 police rate ${{kbit}}kbit burst 64k drop 2>/dev/null
+    done < "$BW"
+fi
 
 tail -f /dev/null
 """
@@ -366,6 +390,80 @@ tail -f /dev/null
             f"docker cp /tmp/_wg_clients.json {self.CONTAINER_NAME}:{self.CLIENTS_TABLE_PATH}"
         )
         self.ssh.run_command("rm -f /tmp/_wg_clients.json")
+
+        # Keep per-peer bandwidth limits in sync (best effort)
+        try:
+            self._apply_bw_limits(clients_table)
+        except Exception as err:
+            logger.warning(f"apply bw limits warning: {err}")
+
+    # ===================== BANDWIDTH LIMITS =====================
+
+    def _apply_bw_limits(self, clients_table):
+        """Write the flat bwlimits file into the container and apply via tc.
+
+        Same mechanism as AWGManager: HTB on egress + ingress policer per
+        peer IPv4. Older containers without iproute2 get it installed on
+        the fly (apk), so no image rebuild is required.
+        """
+        lines = []
+        for client in clients_table:
+            ud = client.get('userData', {}) or {}
+            try:
+                mbps = float(ud.get('maxSpeed') or 0)
+            except (TypeError, ValueError):
+                continue
+            if mbps <= 0:
+                continue
+            ip4 = ud.get('clientIp') or ''
+            if not ip4:
+                continue
+            lines.append(f"{ip4} - {mbps:g}")
+        content = "\n".join(lines) + ("\n" if lines else "")
+        self.ssh.upload_file(content, "/tmp/_wg_bwlimits")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_wg_bwlimits {self.CONTAINER_NAME}:{self.BWLIMITS_PATH}"
+        )
+        self.ssh.run_command("rm -f /tmp/_wg_bwlimits")
+        if not self.check_container_running():
+            return
+        from managers.awg_manager import AWGManager
+        body = AWGManager._tc_apply_body(self.BWLIMITS_PATH, self.CONFIG_PATH)
+        # Install iproute2 on the fly for containers built before the
+        # Dockerfile included it; cheap no-op when tc already exists.
+        body = "command -v tc >/dev/null 2>&1 || apk add --no-cache iproute2 >/dev/null 2>&1\n" + body
+        self.ssh.upload_file(body, "/tmp/_wg_tc.sh")
+        # One `sh -c`: run_sudo_command only privileges the head of a chain,
+        # so `docker cp && docker exec` would run the exec unprivileged.
+        self.ssh.run_sudo_command(
+            "sh -c '"
+            f"docker cp /tmp/_wg_tc.sh {self.CONTAINER_NAME}:/tmp/_wg_tc.sh && "
+            f"docker exec {self.CONTAINER_NAME} bash /tmp/_wg_tc.sh"
+            "'",
+            timeout=60
+        )
+        self.ssh.run_command("rm -f /tmp/_wg_tc.sh")
+
+    def set_speed_limit(self, client_id, max_speed):
+        """Set per-peer bandwidth limit in Mbit/s (0 = unlimited).
+
+        Persisted in clientsTable (userData.maxSpeed); _save_clients_table
+        applies it via tc and the start script re-applies it on boot.
+        """
+        mbps = round(float(max_speed), 1)
+        if mbps < 0:
+            raise RuntimeError('max_speed must be >= 0')
+        clients_table = self._get_clients_table()
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        ud = client.setdefault('userData', {})
+        if mbps == 0:
+            ud.pop('maxSpeed', None)
+        else:
+            ud['maxSpeed'] = mbps
+        self._save_clients_table(clients_table)
+        return {'status': 'success', 'max_speed': mbps}
 
     def _get_server_config(self):
         """Get the server WireGuard config."""
@@ -441,15 +539,64 @@ tail -f /dev/null
                     ips.append(match.group(1))
         return ips
 
+    def _get_reserved_ips(self):
+        """IPv4 addresses reserved in clientsTable by ANY client, disabled included.
+
+        A disabled client keeps its address, so allocation must never hand it
+        to someone else. Raises if the table cannot be read at all — silently
+        treating the reservation pool as empty would break that guarantee.
+        """
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {self.CONTAINER_NAME} cat {self.CLIENTS_TABLE_PATH} 2>/dev/null"
+        )
+        if code != 0:
+            # cat fails both when docker exec is broken and when the file
+            # simply does not exist yet (fresh instance). Fail loudly only
+            # for the former; an absent table means no reservations.
+            _, terr, tcode = self.ssh.run_sudo_command(
+                f"docker exec -i {self.CONTAINER_NAME} true")
+            if tcode != 0:
+                raise RuntimeError(
+                    f"Cannot read clients table from {self.CONTAINER_NAME}: {terr.strip() or err.strip()}")
+            return set()
+        if not out.strip():
+            return set()
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"Clients table in {self.CONTAINER_NAME} is not valid JSON")
+        reserved = set()
+        for c in (data if isinstance(data, list) else []):
+            ud = c.get('userData') or {}
+            value = ud.get('allowedIps') or ud.get('clientIp') or ''
+            match = re.search(r'(\d+\.\d+\.\d+\.\d+)', str(value))
+            if match:
+                reserved.add(match.group(1))
+        return reserved
+
     def _get_next_ip(self):
         """Return the first free IP in the subnet, filling gaps left by deleted clients.
 
         The old implementation took the last IP in file order and incremented it,
         which produced duplicate IPs when peers were not sorted by IP and never
         reused addresses freed by deleted clients.
+
+        Occupied = active config peers + reservations in clientsTable (disabled
+        clients keep their IPs; only deletion releases an address).
         """
-        used_ips = self._get_used_ips()
+        used_ips = set(self._get_used_ips()) | self._get_reserved_ips()
+        # The subnet comes from the live config (imported instances may use a
+        # subnet different from the default).
         base = WG_DEFAULTS['subnet_address']
+        config = self._get_server_config()
+        for line in config.split('\n'):
+            line = line.strip()
+            if line.startswith('Address'):
+                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                if match:
+                    base = match.group(1)
+                break
         parts = base.split('.')
         prefix = '.'.join(parts[:3])
 
@@ -761,6 +908,28 @@ PersistentKeepalive = 25
             ud = client.get('userData', {})
             psk = ud.get('psk', '') or self._get_server_psk()
             client_ip = ud.get('clientIp', '')
+            if client_ip:
+                # A disabled client's address stays reserved in clientsTable.
+                # Refuse to re-enable when another client owns it now.
+                for other in clients_table:
+                    if other.get('clientId') == client_id:
+                        continue
+                    other_ud = other.get('userData') or {}
+                    other_val = other_ud.get('allowedIps') or other_ud.get('clientIp') or ''
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', str(other_val))
+                    if m and m.group(1) == client_ip:
+                        raise RuntimeError(
+                            f"Cannot enable client: IP {client_ip} is already "
+                            f"reserved by another client. Resolve the conflict "
+                            f"(delete one of them) first.")
+                if client_ip in self._get_used_ips():
+                    raise RuntimeError(
+                        f"Cannot enable client: IP {client_ip} is already "
+                        f"present in the active server config")
+            if not client_ip:
+                client_ip = self._get_next_ip()
+                ud['clientIp'] = client_ip
+                client.setdefault('userData', {})['clientIp'] = client_ip
 
             peer_section = f"""
 [Peer]

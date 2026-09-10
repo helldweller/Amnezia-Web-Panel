@@ -49,6 +49,7 @@ from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
+from pwa import build_manifest
 from connection_service import (
     ConnectionService,
     DEFAULT_SELF_SERVICE_SETTINGS,
@@ -112,13 +113,31 @@ async def custom_redoc():
     return get_redoc_html(
         openapi_url=app.openapi_url or "/openapi.json",
         title=f"{app.title} — ReDoc",
-        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+        redoc_js_url="/static/vendor/redoc/redoc.standalone.js",
         with_google_fonts=False,
     )
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
 # Mount static files & templates
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+class CachedStaticFiles(StaticFiles):
+    """Static assets that carry ?v=<static mtime> (see static_version()) change
+    their URL on every redeploy, so they can be cached for 180 days. Assets
+    referenced without that query - the favicon, the icons, qrcode.min.js,
+    searchable-select.js, the vendored CodeMirror and ReDoc bundles - keep the
+    same URL forever, so an immutable lifetime would freeze them in the
+    browser until it expires. Those get an hour and a revalidation instead."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            query = urllib.parse.parse_qsl(scope.get('query_string', b'').decode('latin-1'))
+            fingerprinted = any(key == 'v' for key, _value in query)
+            response.headers['Cache-Control'] = (
+                'public, max-age=15552000, immutable' if fingerprinted
+                else 'public, max-age=3600, must-revalidate')
+        return response
+
+app.mount("/static", CachedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 if getattr(sys, 'frozen', False):
@@ -129,7 +148,10 @@ else:
 DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
-CURRENT_VERSION = "v1.6.3"
+CURRENT_VERSION = "v1.6.5"
+
+# Custom protocol instance names: the rename modal caps input at 64 chars.
+CUSTOM_PROTOCOL_NAME_MAX = 64
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
 
@@ -1973,6 +1995,32 @@ def tpl(request, template, **kwargs):
     return templates.TemplateResponse(template, ctx)
 
 
+@app.get('/manifest.webmanifest')
+async def web_manifest(request: Request):
+    """Installable PWA manifest — public, no auth (browsers fetch without credentials)."""
+    data = load_data()
+    lang = request.cookies.get('lang', 'en')
+    appearance = data.get('settings', {}).get('appearance', {})
+    return JSONResponse(
+        build_manifest(appearance, lang),
+        media_type='application/manifest+json',
+    )
+
+
+@app.get('/sw.js')
+async def service_worker():
+    """Root-scoped service worker. Must not live under /static/ or scope is confined."""
+    path = os.path.join(application_path, 'static', 'sw.js')
+    return FileResponse(
+        path,
+        media_type='text/javascript',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Service-Worker-Allowed': '/',
+        },
+    )
+
+
 # ======================== Pydantic Models ========================
 
 class LoginRequest(BaseModel):
@@ -2096,6 +2144,24 @@ class ContainerToggleRequest(ProtocolRequest):
     force: Optional[bool] = False
 
 
+class WgEasyPreviewRequest(BaseModel):
+    web_port: int = 51821
+    password: str = ''
+    username: Optional[str] = 'admin'
+
+
+class WgEasyImportRequest(BaseModel):
+    web_port: int = 51821
+    password: str = ''
+    username: Optional[str] = 'admin'
+    client_ids: Optional[list] = None  # None = import all
+    target: str = 'auto'  # auto | wireguard | awg2
+      
+class RenameProtocolRequest(BaseModel):
+    protocol: str = ''
+    name: str = ''  # empty = reset to default
+
+
 class AddConnectionRequest(BaseModel):
     protocol: str = 'awg'
     name: str = 'Connection'
@@ -2144,8 +2210,10 @@ class ToggleConnectionRequest(BaseModel):
 
 class AddUserRequest(BaseModel):
     username: str
-    password: str
-    role: str = 'user'
+    # Password is optional: role 'none' (the default) is a record-only user
+    # who cannot log in, so no password is needed. Any real role requires one.
+    password: Optional[str] = None
+    role: str = 'none'
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -2236,6 +2304,7 @@ class SelfServiceConnectionRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -2712,7 +2781,7 @@ async def index(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
-    if user['role'] == 'user':
+    if user['role'] not in ('admin', 'support'):
         return RedirectResponse(url='/my', status_code=302)
     data = load_data()
     return tpl(request, 'index.html', servers=data['servers'])
@@ -2799,8 +2868,13 @@ async def api_login(request: Request, req: LoginRequest):
         request.session.pop('captcha_answer', None)
 
     for u in data.get('users', []):
-        if u['username'] == req.username and verify_password(req.password, u['password_hash']):
+        # Users without a password (role 'none', record-only) can never log in.
+        if u['username'] == req.username and u.get('password_hash') and verify_password(req.password, u['password_hash']):
             lang = request.cookies.get('lang', 'ru')
+            if u.get('role') == 'none':
+                # Record-only account: even a password set later does not
+                # grant access until a real role is assigned.
+                return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
             if not u.get('enabled', True):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
             request.session['user_id'] = u['id']
@@ -4286,6 +4360,135 @@ async def api_host_tuning(request: Request, server_id: int):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/wgeasy/preview', tags=["Protocols"])
+async def api_wgeasy_preview(request: Request, server_id: int, req: WgEasyPreviewRequest):
+    """Fetch the client list from a wg-easy / amnezia-wg-easy panel running on
+    this server (via its local web API over SSH). No secrets are returned."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    from managers.wgeasy_import import WgEasyError
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            from managers.wgeasy_import import WgEasyImporter, normalize_clients
+            importer = WgEasyImporter(ssh, web_port=req.web_port)
+            backup = importer.fetch_backup(req.password, req.username or 'admin')
+            clients = normalize_clients(backup)
+            _, listen_port, _, obfuscation = importer.detect_source()
+        finally:
+            ssh.disconnect()
+        return {
+            'status': 'success',
+            'release': backup.get('_release'),
+            'server_address': (backup.get('server') or {}).get('address', ''),
+            'listen_port': int(listen_port),
+            'obfuscation': bool(obfuscation),
+            'recommended_target': 'awg2' if obfuscation else 'wireguard',
+            'clients': [{
+                'id': c['id'],
+                'name': c['name'],
+                'address': c['address'],
+                'enabled': c['enabled'],
+            } for c in clients],
+            'has_server_private_key': bool((backup.get('server') or {}).get('privateKey')),
+        }
+    except WgEasyError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error previewing wg-easy import")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/protocol/rename', tags=["Protocols"])
+async def api_rename_protocol(request: Request, server_id: int, req: RenameProtocolRequest):
+    """Set or clear a custom display name for an installed protocol instance."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        proto = req.protocol.strip()
+        if proto not in server.get('protocols', {}):
+            return JSONResponse({'error': 'Protocol not found'}, status_code=404)
+        # The modal caps input at 64 chars; the API has to cap it too, or a
+        # direct call parks an unbounded string in data.json forever.
+        name = req.name.strip()[:CUSTOM_PROTOCOL_NAME_MAX]
+        if name:
+            server['protocols'][proto]['custom_name'] = name
+        else:
+            server['protocols'][proto].pop('custom_name', None)
+        save_data(data)
+        return {'status': 'success', 'protocol': proto, 'name': name}
+    except Exception as e:
+        logger.exception("Error renaming protocol")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/wgeasy/import', tags=["Protocols"])
+async def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest):
+    """Migrate clients from a wg-easy panel on this server into a panel-managed
+    WireGuard instance, preserving keys/IPs/port so client configs keep working."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    from managers.wgeasy_import import WgEasyError  # noqa: needed in except below
+    log = []
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        if 'protocols' not in server:
+            server['protocols'] = {}
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            from managers.wgeasy_import import WgEasyImporter, WgEasyError, run_import
+            importer = WgEasyImporter(ssh, web_port=req.web_port)
+            backup = importer.fetch_backup(req.password, req.username or 'admin')
+            _, _, _, obfuscation = importer.detect_source()
+            target = req.target if req.target in ('wireguard', 'awg2') else (
+                'awg2' if obfuscation else 'wireguard')
+            # Additional instances are supported for AWG 2.0: when the first
+            # slot is taken, import as the next free instance key (awg2__2,
+            # awg2__3, ...). WireGuard is single-instance for now.
+            if target in server['protocols'] and target != 'awg2':
+                return JSONResponse(
+                    {'error': f'Protocol {target} is already installed on this server. '
+                              'Remove it first if you want to re-import.'}, status_code=400)
+            if target == 'awg2' and any(k.split('__', 1)[0] == 'awg2'
+                                        for k in server['protocols']):
+                target = next_protocol_key(server['protocols'], 'awg2')
+            result = run_import(ssh, backup, client_ids=req.client_ids,
+                                target=target, log=log)
+            result['log'] = log
+        finally:
+            ssh.disconnect()
+
+        server['protocols'][target] = {
+            'installed': True,
+            'port': result['port'],
+            'awg_params': {},
+            'base_protocol': protocol_base(target),
+            'instance': protocol_instance(target),
+            'display_name': protocol_display_name(target),
+            'container_name': protocol_container_name(target),
+        }
+        save_data(data)
+        return result
+    except WgEasyError as e:
+        return JSONResponse({'error': str(e), 'log': log}, status_code=400)
+    except Exception as e:
+        logger.exception("Error importing from wg-easy")
+        return JSONResponse({'error': str(e), 'log': log}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
 async def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
@@ -4633,7 +4836,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         # Users can only view their own connections
-        if user['role'] == 'user':
+        if user['role'] in ('user', 'none'):
             owned = any(
                 c for c in data.get('user_connections', [])
                 if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
@@ -4751,12 +4954,14 @@ async def api_add_user(request: Request, req: AddUserRequest):
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
-        if req.role not in ('admin', 'support', 'user'):
-            return JSONResponse({'error': 'Invalid role'}, status_code=400)
+        if req.role not in ('admin', 'support', 'user', 'none'):
+            return JSONResponse({'error': _t('invalid_role', lang)}, status_code=400)
+        if req.role != 'none' and not req.password:
+            return JSONResponse({'error': _t('password_required_for_role', lang)}, status_code=400)
         new_user = {
             'id': str(uuid.uuid4()),
             'username': req.username,
-            'password_hash': hash_password(req.password),
+            'password_hash': hash_password(req.password) if req.password else None,
             'role': req.role,
             'telegramId': telegram_id,
             'email': req.email,
@@ -4836,6 +5041,14 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({'error': 'User not found'}, status_code=404)
             
+        if req.username is not None:
+            new_name = req.username.strip()
+            lang = request.cookies.get('lang', 'ru')
+            if not new_name:
+                return JSONResponse({'error': _t('username_empty', lang)}, status_code=400)
+            if any(u['username'] == new_name and u['id'] != user_id for u in data.get('users', [])):
+                return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
+            user['username'] = new_name
         if req.telegramId is not None:
             try:
                 user['telegramId'] = _normalize_telegram_id(req.telegramId)
@@ -5003,7 +5216,7 @@ async def api_get_user_connections(request: Request, user_id: str):
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # Users can only see their own, admin/support can see all
-    if user['role'] == 'user' and user['id'] != user_id:
+    if user['role'] in ('user', 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
